@@ -479,17 +479,18 @@ select_mode() {
   while true; do
     echo >&2
     echo "Select VPN type:" >&2
-    echo "  1) VLESS" >&2
-    echo "  2) VLESS + REALITY" >&2
-    read -r -p "Enter number [1-2]: " choice
+    echo "  1) VLESS + REALITY" >&2
+    echo "  2) VLESS" >&2
+    read -r -p "Enter number [1-2] (default: 1): " choice
+    choice="${choice:-1}"
 
     case "$choice" in
       1)
-        echo "vless"
+        echo "reality"
         return
         ;;
       2)
-        echo "reality"
+        echo "vless"
         return
         ;;
       *)
@@ -506,7 +507,8 @@ select_input_type() {
     echo "Config input format:" >&2
     echo "  1) VLESS URL (vless://...)" >&2
     echo "  2) JSON config" >&2
-    read -r -p "Enter number [1-2]: " choice
+    read -r -p "Enter number [1-2] (default: 1): " choice
+    choice="${choice:-1}"
 
     case "$choice" in
       1)
@@ -655,8 +657,26 @@ configure_vpn() {
   run_root systemctl enable sing-box >/dev/null
   run_root systemctl restart sing-box
 
-  log "VPN config applied and service restarted"
-  run_root systemctl status sing-box --no-pager --lines=10
+  if run_root systemctl is-active --quiet sing-box; then
+    local current_ip
+    current_ip=""
+
+    if command -v curl >/dev/null 2>&1; then
+      current_ip="$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+      [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+      [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://2ip.ru 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$current_ip" ]]; then
+      log "VPN config applied. All good."
+      echo "[INFO] Your current public IP: $current_ip"
+    else
+      log "VPN config applied. All good."
+      echo "[INFO] Could not detect public IP automatically."
+    fi
+  else
+    die "sing-box failed to start. Run: makrelbka-vpnc logs"
+  fi
 }
 
 usage() {

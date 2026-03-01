@@ -22,13 +22,14 @@ Default installed `sing-box` version is `1.12.0` (stable with this config format
 ## One-line run (after you publish to GitHub)
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/<your-user>/<your-repo>/main/singbox-bootstrap/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makrelbka/makrelbka-vpnc/main/install.sh)
+
 ```
 
 ## Optional run without immediate interactive setup
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/<your-user>/<your-repo>/main/singbox-bootstrap/install.sh) --no-configure
+bash <(curl -fsSL https://raw.githubusercontent.com/makrelbka/makrelbka-vpnc/main/install.sh) --no-configure
 ```
 
 ## Service / VPN management
