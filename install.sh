@@ -505,6 +505,56 @@ select_mode() {
   done
 }
 
+select_user_scope() {
+  local choice
+  while true; do
+    echo >&2
+    echo "Apply VPN for:" >&2
+    echo "  1) All users" >&2
+    echo "  2) Only selected users" >&2
+    read -r -p "Enter number [1-2] (default: 1): " choice
+    choice="${choice:-1}"
+
+    case "$choice" in
+      1)
+        echo "all"
+        return
+        ;;
+      2)
+        echo "selected"
+        return
+        ;;
+      *)
+        echo "Invalid choice" >&2
+        ;;
+    esac
+  done
+}
+
+read_selected_user_uids() {
+  local input user uid
+  local -a users=()
+  local -a uids=()
+
+  echo
+  read -r -p "Enter usernames separated by spaces: " input
+
+  [[ -n "${input//[[:space:]]/}" ]] || die "No usernames provided"
+
+  read -r -a users <<<"$input"
+
+  for user in "${users[@]}"; do
+    if ! id "$user" >/dev/null 2>&1; then
+      die "User does not exist: $user"
+    fi
+
+    uid="$(id -u "$user")"
+    uids+=("$uid")
+  done
+
+  printf '%s\n' "${uids[@]}" | jq -R . | jq -s .
+}
+
 select_input_type() {
   local choice
   while true; do
@@ -583,11 +633,14 @@ UNIT_EOF
 }
 write_config() {
   local outbound="$1"
+  local include_uids_json="${2:-[]}"
   local tmp_config backup_file
 
   tmp_config="$(mktemp)"
 
-  jq -n --argjson outbound "$outbound" '
+  jq -n \
+    --argjson outbound "$outbound" \
+    --argjson include_uids "$include_uids_json" '
     {
       log: { level: "info" },
       dns: {
@@ -606,17 +659,25 @@ write_config() {
         final: "cloudflare"
       },
       inbounds: [
-        {
-          type: "tun",
-          tag: "tun-in",
-          interface_name: "sbtun",
-          address: ["198.18.0.1/30"],
-          auto_route: true,
-          auto_redirect: true,
-          strict_route: true,
-          mtu: 1500,
-          stack: "system"
-        }
+        (
+          {
+            type: "tun",
+            tag: "tun-in",
+            interface_name: "sbtun",
+            address: ["198.18.0.1/30"],
+            auto_route: true,
+            auto_redirect: true,
+            strict_route: true,
+            mtu: 1500,
+            stack: "system"
+          }
+          +
+          (if ($include_uids | length) > 0 then
+             { include_uid: $include_uids }
+           else
+             {}
+           end)
+        )
       ],
       outbounds: [
         $outbound,
@@ -644,14 +705,15 @@ write_config() {
   run_root install -m 0600 "$tmp_config" "$CONFIG_FILE"
   rm -f "$tmp_config"
 }
-
 configure_vpn() {
-  ensure_cmd jq systemctl sing-box
+  ensure_cmd jq systemctl sing-box id
 
-  local mode input_type outbound uri json_payload
+  local mode input_type user_scope outbound uri json_payload include_uids_json
 
   mode="$(select_mode)"
   input_type="$(select_input_type)"
+  user_scope="$(select_user_scope)"
+  include_uids_json='[]'
 
   if [[ "$input_type" == "url" ]]; then
     echo
@@ -662,7 +724,11 @@ configure_vpn() {
     outbound="$(build_outbound_from_json "$json_payload" "$mode")"
   fi
 
-  write_config "$outbound"
+  if [[ "$user_scope" == "selected" ]]; then
+    include_uids_json="$(read_selected_user_uids)"
+  fi
+  
+  write_config "$outbound" "$include_uids_json"
   write_service_file
 
   run_root systemctl daemon-reload
