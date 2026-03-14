@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SKIP_BOOTSTRAP=0
+if [[ $# -gt 0 ]] && [[ "$1" != "install" ]] && [[ "$1" != "--no-configure" ]]; then
+  SKIP_BOOTSTRAP=1
+fi
+
 SCRIPT_NAME="makrelbka-vpnc"
 MANAGER_PATH="/usr/local/bin/makrelbka-vpnc"
 
@@ -818,4 +823,41 @@ main() {
   fi
 }
 
-main "$@"
+main() {
+  ... (ваша существующая функция main)
+}
+
+# Эта функция вызывается ТОЛЬКО при установке
+bootstrap() {
+  local no_configure="0"
+  if [[ "${1:-}" == "--no-configure" ]]; then
+    no_configure="1"
+  fi
+
+  install_dependencies
+  install_sing_box
+  install_manager
+
+  log "Bootstrap completed"
+  echo
+  echo "Use these commands:"
+  echo "  makrelbka-vpnc configure"
+  echo "  makrelbka-vpnc status"
+  echo "  makrelbka-vpnc start|stop|restart"
+  echo
+
+  if [[ "$no_configure" == "0" ]]; then
+    "$MANAGER_PATH" configure
+  else
+    log "Skipping interactive configure (--no-configure)"
+  fi
+}
+
+# Основная логика
+if [[ $SKIP_BOOTSTRAP -eq 1 ]]; then
+  # Если вызваны с командой (uninstall, status и т.д.), просто выполняем команду
+  main "$@"
+else
+  # Если вызваны без команды или с install, выполняем установку
+  bootstrap "$@"
+fi
