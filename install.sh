@@ -797,7 +797,8 @@ MANAGER_EOF
   log "Installed manager command: $MANAGER_PATH"
 }
 
-main() {
+# Это функция установки (bootstrap)
+bootstrap() {
   local no_configure="0"
   if [[ "${1:-}" == "--no-configure" ]]; then
     no_configure="1"
@@ -823,37 +824,16 @@ main() {
   fi
 }
 
-
-# Эта функция вызывается ТОЛЬКО при установке
-bootstrap() {
-  local no_configure="0"
-  if [[ "${1:-}" == "--no-configure" ]]; then
-    no_configure="1"
-  fi
-
-  install_dependencies
-  install_sing_box
-  install_manager
-
-  log "Bootstrap completed"
-  echo
-  echo "Use these commands:"
-  echo "  makrelbka-vpnc configure"
-  echo "  makrelbka-vpnc status"
-  echo "  makrelbka-vpnc start|stop|restart"
-  echo
-
-  if [[ "$no_configure" == "0" ]]; then
-    "$MANAGER_PATH" configure
-  else
-    log "Skipping interactive configure (--no-configure)"
-  fi
-}
-
 # Основная логика
 if [[ $SKIP_BOOTSTRAP -eq 1 ]]; then
-  # Если вызваны с командой (uninstall, status и т.д.), просто выполняем команду
-  main "$@"
+  # Если вызваны с командой (uninstall, status и т.д.), 
+  # нужно выполнить команду через установленный менеджер
+  if [[ -f "$MANAGER_PATH" ]]; then
+    "$MANAGER_PATH" "$@"
+  else
+    echo "[ERROR] Manager not found at $MANAGER_PATH"
+    exit 1
+  fi
 else
   # Если вызваны без команды или с install, выполняем установку
   bootstrap "$@"
