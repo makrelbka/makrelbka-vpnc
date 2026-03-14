@@ -765,6 +765,9 @@ main() {
     disable)
       run_root systemctl disable sing-box
       ;;
+    uninstall)                    # <-- ДОБАВЬТЕ ЭТОТ БЛОК
+      uninstall_vpn
+      ;;
     logs)
       run_root journalctl -u sing-box -f
       ;;
