@@ -581,7 +581,6 @@ WantedBy=multi-user.target
 UNIT_EOF
   fi
 }
-
 write_config() {
   local outbound="$1"
   local tmp_config backup_file
@@ -593,8 +592,16 @@ write_config() {
       log: { level: "info" },
       dns: {
         servers: [
-          { tag: "cloudflare", address: "tls://1.1.1.1" },
-          { tag: "google", address: "tls://8.8.8.8" }
+          {
+            type: "tls",
+            tag: "cloudflare",
+            server: "1.1.1.1"
+          },
+          {
+            type: "tls",
+            tag: "google",
+            server: "8.8.8.8"
+          }
         ],
         final: "cloudflare"
       },
@@ -608,23 +615,18 @@ write_config() {
           auto_redirect: true,
           strict_route: true,
           mtu: 1500,
-          stack: "system",
-          sniff: true
+          stack: "system"
         }
       ],
       outbounds: [
         $outbound,
-        { type: "dns", tag: "dns-out" },
-        { type: "direct", tag: "direct" },
-        { type: "block", tag: "block" }
+        { type: "direct", tag: "direct" }
       ],
       route: {
         auto_detect_interface: true,
         rules: [
-          {
-            port: 53,
-            outbound: "dns-out"
-          }
+          { action: "sniff" },
+          { protocol: "dns", action: "hijack-dns" }
         ],
         final: "vless-out"
       }
