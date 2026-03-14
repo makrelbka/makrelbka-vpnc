@@ -697,10 +697,47 @@ Commands:
   restart       Restart VPN service
   enable        Enable autostart on boot
   disable       Disable autostart on boot
+  uninstall     Completely remove sing-box and all configurations
   logs          Follow sing-box logs
   show-config   Print /etc/sing-box/config.json
   help          Show this help
 HELP_EOF
+}
+
+uninstall_vpn() {
+  echo "[WARN] This will completely remove sing-box and all its configurations!"
+  echo "[WARN] The following will be deleted:"
+  echo "  - /usr/local/bin/sing-box"
+  echo "  - /etc/sing-box/"
+  echo "  - /etc/systemd/system/sing-box.service"
+  echo "  - /usr/local/bin/makrelbka-vpnc"
+  echo
+  read -r -p "Are you absolutely sure? Type 'yes' to continue: " confirmation
+  
+  if [[ "$confirmation" != "yes" ]]; then
+    echo "Uninstall cancelled."
+    return
+  fi
+
+  echo "Stopping and disabling sing-box service..."
+  run_root systemctl stop sing-box 2>/dev/null || true
+  run_root systemctl disable sing-box 2>/dev/null || true
+  
+  echo "Removing systemd service file..."
+  run_root rm -f /etc/systemd/system/sing-box.service
+  run_root systemctl daemon-reload
+  
+  echo "Removing sing-box binary..."
+  run_root rm -f /usr/local/bin/sing-box
+  
+  echo "Removing configuration directory..."
+  run_root rm -rf /etc/sing-box
+  
+  echo "Removing manager script..."
+  run_root rm -f /usr/local/bin/makrelbka-vpnc
+  
+  echo "[SUCCESS] sing-box has been completely uninstalled."
+  echo "You may want to reboot your system to clean up any remaining TUN interfaces."
 }
 
 main() {
