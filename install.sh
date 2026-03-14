@@ -602,19 +602,24 @@ write_config() {
           auto_route: true,
           auto_redirect: true,
           strict_route: true,
-          mtu: 1500
+          mtu: 1500,
+          stack: "system",
+          sniff: true
         }
       ],
       outbounds: [
         $outbound,
+        { type: "dns", tag: "dns-out" },
         { type: "direct", tag: "direct" },
         { type: "block", tag: "block" }
       ],
       route: {
         auto_detect_interface: true,
         rules: [
-          { port: 53, action: "hijack-dns" },
-          { inbound: "tun-in", outbound: "vless-out" }
+          {
+            port: 53,
+            outbound: "dns-out"
+          }
         ],
         final: "vless-out"
       }
