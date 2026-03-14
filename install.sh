@@ -667,7 +667,10 @@ configure_vpn() {
 
   run_root systemctl daemon-reload
   run_root systemctl enable sing-box >/dev/null
+
+  run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE"
   run_root systemctl restart sing-box
+  sleep 2
 
   if run_root systemctl is-active --quiet sing-box; then
     local current_ip
