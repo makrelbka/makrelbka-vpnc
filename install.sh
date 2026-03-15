@@ -10,7 +10,6 @@ SCRIPT_NAME="vpnc"
 MANAGER_PATH="/usr/local/bin/vpnc"
 LEGACY_MANAGER_PATH="/usr/local/bin/makrelbka-vpnc"
 
-
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
   if ! command -v sudo >/dev/null 2>&1; then
@@ -47,35 +46,36 @@ ensure_sudo() {
 }
 
 install_dependencies() {
-  local missing=()
+  local missing_cmds=()
   local cmd
-  for cmd in curl jq tar; do
+
+  for cmd in curl jq tar nft; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-      missing+=("$cmd")
+      missing_cmds+=("$cmd")
     fi
   done
 
-  if (( ${#missing[@]} == 0 )); then
+  if (( ${#missing_cmds[@]} == 0 )); then
     return
   fi
 
-  log "Installing dependencies: ${missing[*]}"
+  log "Installing dependencies: ${missing_cmds[*]}"
 
   if command -v apt-get >/dev/null 2>&1; then
     run_root apt-get update -y
-    run_root apt-get install -y curl jq tar ca-certificates
+    run_root apt-get install -y curl jq tar ca-certificates nftables
   elif command -v dnf >/dev/null 2>&1; then
-    run_root dnf install -y curl jq tar ca-certificates
+    run_root dnf install -y curl jq tar ca-certificates nftables
   elif command -v yum >/dev/null 2>&1; then
-    run_root yum install -y curl jq tar ca-certificates
+    run_root yum install -y curl jq tar ca-certificates nftables
   elif command -v pacman >/dev/null 2>&1; then
-    run_root pacman -Sy --noconfirm curl jq tar ca-certificates
+    run_root pacman -Sy --noconfirm curl jq tar ca-certificates nftables
   elif command -v zypper >/dev/null 2>&1; then
-    run_root zypper --non-interactive install curl jq tar ca-certificates
+    run_root zypper --non-interactive install curl jq tar ca-certificates nftables
   elif command -v apk >/dev/null 2>&1; then
-    run_root apk add --no-cache curl jq tar ca-certificates
+    run_root apk add --no-cache curl jq tar ca-certificates nftables
   else
-    die "Unsupported package manager. Install curl, jq, tar manually."
+    die "Unsupported package manager. Install curl, jq, tar and nftables manually."
   fi
 }
 
@@ -164,7 +164,14 @@ set -Eeuo pipefail
 
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
+STATE_FILE="/etc/sing-box/vpnc-state.json"
+NFT_DIR="/etc/sing-box/nftables.d"
+NFT_FILE="${NFT_DIR}/vpnc-selected-users.nft"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
+SELECTED_MARK_HEX="0x2023"
+SELECTED_MARK_NFT="0x00002023"
+SELECTED_ROUTE_TABLE="10023"
+SELECTED_RULE_PREF="8990"
 
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
@@ -509,12 +516,31 @@ select_mode() {
 }
 
 select_user_scope() {
-  echo >&2
-  echo "Apply VPN for: all users" >&2
-  echo "Selected-users mode is temporarily disabled." >&2
-  echo "all"
-}
+  local choice
+  while true; do
+    echo >&2
+    echo "Apply VPN for:" >&2
+    echo "  1) All users" >&2
+    echo "  2) Only selected users" >&2
+    echo "     note: implemented via custom nftables UID rules" >&2
+    read -r -p "Enter number [1-2] (default: 1): " choice
+    choice="${choice:-1}"
 
+    case "$choice" in
+      1)
+        echo "all"
+        return
+        ;;
+      2)
+        echo "selected"
+        return
+        ;;
+      *)
+        echo "Invalid choice" >&2
+        ;;
+    esac
+  done
+}
 
 read_selected_user_uids() {
   local input user uid
@@ -538,6 +564,21 @@ read_selected_user_uids() {
   done
 
   printf '%s\n' "${uids[@]}" | jq -R 'tonumber' | jq -s .
+}
+
+read_json_payload() {
+  local payload json_path
+  echo >&2
+  echo "Paste JSON below, then press Ctrl-D:" >&2
+  payload="$(cat)"
+
+  if [[ -z "${payload//[[:space:]]/}" ]]; then
+    read -r -p "No JSON pasted. Enter path to JSON file: " json_path
+    [[ -f "$json_path" ]] || die "File does not exist: $json_path"
+    payload="$(cat "$json_path")"
+  fi
+
+  echo "$payload"
 }
 
 select_input_type() {
@@ -566,21 +607,6 @@ select_input_type() {
   done
 }
 
-read_json_payload() {
-  local payload
-  echo >&2
-  echo "Paste JSON below, then press Ctrl-D:" >&2
-  payload="$(cat)"
-
-  if [[ -z "${payload//[[:space:]]/}" ]]; then
-    read -r -p "No JSON pasted. Enter path to JSON file: " json_path
-    [[ -f "$json_path" ]] || die "File does not exist: $json_path"
-    payload="$(cat "$json_path")"
-  fi
-
-  echo "$payload"
-}
-
 write_service_file() {
   if [[ -n "$SUDO" ]]; then
     $SUDO tee "$SERVICE_FILE" >/dev/null <<'UNIT_EOF'
@@ -592,6 +618,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecStartPost=-/usr/local/bin/vpnc _apply-selected-routing
+ExecStopPost=-/usr/local/bin/vpnc _clear-selected-routing
 Restart=always
 RestartSec=3
 
@@ -608,6 +636,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecStartPost=-/usr/local/bin/vpnc _apply-selected-routing
+ExecStopPost=-/usr/local/bin/vpnc _clear-selected-routing
 Restart=always
 RestartSec=3
 
@@ -616,16 +646,46 @@ WantedBy=multi-user.target
 UNIT_EOF
   fi
 }
+
+write_state_file() {
+  local user_scope="$1"
+  local include_uids_json="${2:-[]}"
+  local tmp_state
+
+  tmp_state="$(mktemp)"
+
+  jq -n \
+    --arg user_scope "$user_scope" \
+    --argjson include_uids "$include_uids_json" '
+    {
+      user_scope: $user_scope,
+      include_uids: $include_uids
+    }
+  ' > "$tmp_state"
+
+  run_root install -d -m 0755 "$CONFIG_DIR"
+  run_root install -m 0600 "$tmp_state" "$STATE_FILE"
+  rm -f "$tmp_state"
+}
+
 write_config() {
   local outbound="$1"
-  local include_uids_json="${2:-[]}"
-  local tmp_config backup_file
+  local user_scope="$2"
+  local auto_route_json auto_redirect_json tmp_config backup_file
+
+  auto_route_json=false
+  auto_redirect_json=false
+  if [[ "$user_scope" == "all" ]]; then
+    auto_route_json=true
+    auto_redirect_json=true
+  fi
 
   tmp_config="$(mktemp)"
 
   jq -n \
     --argjson outbound "$outbound" \
-    --argjson include_uids "$include_uids_json" '
+    --argjson auto_route "$auto_route_json" \
+    --argjson auto_redirect "$auto_redirect_json" '
     {
       log: { level: "info" },
       dns: {
@@ -644,25 +704,17 @@ write_config() {
         final: "cloudflare"
       },
       inbounds: [
-        (
-          {
-            type: "tun",
-            tag: "tun-in",
-            interface_name: "sbtun",
-            address: ["198.18.0.1/30"],
-            auto_route: true,
-            auto_redirect: true,
-            strict_route: true,
-            mtu: 1500,
-            stack: "system"
-          }
-          +
-          (if ($include_uids | length) > 0 then
-             { include_uid: $include_uids }
-           else
-             {}
-           end)
-        )
+        {
+          type: "tun",
+          tag: "tun-in",
+          interface_name: "sbtun",
+          address: ["198.18.0.1/30"],
+          auto_route: $auto_route,
+          auto_redirect: $auto_redirect,
+          strict_route: true,
+          mtu: 1500,
+          stack: "system"
+        }
       ],
       outbounds: [
         $outbound,
@@ -690,8 +742,89 @@ write_config() {
   run_root install -m 0600 "$tmp_config" "$CONFIG_FILE"
   rm -f "$tmp_config"
 }
+
+delete_ip_rule_pref() {
+  local pref="$1"
+  while run_root ip rule del pref "$pref" 2>/dev/null; do :; done
+}
+
+clear_selected_routing() {
+  run_root nft delete table inet vpnc 2>/dev/null || true
+  delete_ip_rule_pref "$SELECTED_RULE_PREF"
+  run_root ip route flush table "$SELECTED_ROUTE_TABLE" 2>/dev/null || true
+}
+
+clear_legacy_sing_box_routing() {
+  run_root nft delete table inet sing-box 2>/dev/null || true
+  delete_ip_rule_pref 9000
+  delete_ip_rule_pref 9001
+  delete_ip_rule_pref 9002
+  delete_ip_rule_pref 9003
+  run_root ip route flush table 2022 2>/dev/null || true
+}
+
+remove_custom_nft_files() {
+  run_root rm -f "$NFT_FILE"
+  run_root rmdir "$NFT_DIR" 2>/dev/null || true
+}
+
+write_custom_nft_file() {
+  local include_uids_json="$1"
+  local tmp_nft uid_set
+
+  uid_set="$(jq -r 'map(tostring) | join(", ")' <<<"$include_uids_json")"
+  [[ -n "$uid_set" ]] || die "No UIDs provided for selected-users mode"
+
+  tmp_nft="$(mktemp)"
+  cat > "$tmp_nft" <<NFT_EOF
+table inet vpnc {
+  chain output {
+    type route hook output priority mangle; policy accept;
+    meta mark $SELECTED_MARK_NFT return
+    meta skuid { ${uid_set} } meta mark set $SELECTED_MARK_NFT
+  }
+}
+NFT_EOF
+
+  run_root install -d -m 0755 "$NFT_DIR"
+  run_root install -m 0644 "$tmp_nft" "$NFT_FILE"
+  rm -f "$tmp_nft"
+}
+
+apply_selected_routing_from_state() {
+  ensure_cmd jq nft ip
+
+  if ! run_root test -f "$STATE_FILE"; then
+    clear_selected_routing
+    return
+  fi
+
+  local user_scope include_uids_json
+  user_scope="$(run_root jq -r '.user_scope // "all"' "$STATE_FILE")"
+
+  if [[ "$user_scope" != "selected" ]]; then
+    clear_selected_routing
+    remove_custom_nft_files
+    return
+  fi
+
+  include_uids_json="$(run_root jq -c '.include_uids // []' "$STATE_FILE")"
+  if [[ "$include_uids_json" == "[]" ]]; then
+    clear_selected_routing
+    die "Selected-users mode requested, but include_uids is empty in $STATE_FILE"
+  fi
+
+  write_custom_nft_file "$include_uids_json"
+  clear_selected_routing
+  clear_legacy_sing_box_routing
+  run_root ip route replace table "$SELECTED_ROUTE_TABLE" 198.18.0.0/30 dev sbtun src 198.18.0.1
+  run_root ip route replace table "$SELECTED_ROUTE_TABLE" default via 198.18.0.2 dev sbtun
+  run_root ip rule add fwmark "$SELECTED_MARK_HEX" lookup "$SELECTED_ROUTE_TABLE" pref "$SELECTED_RULE_PREF"
+  run_root nft -f "$NFT_FILE"
+}
+
 configure_vpn() {
-  ensure_cmd jq systemctl sing-box id
+  ensure_cmd jq systemctl sing-box id nft ip
 
   local mode input_type user_scope outbound uri json_payload include_uids_json
 
@@ -712,9 +845,17 @@ configure_vpn() {
   if [[ "$user_scope" == "selected" ]]; then
     include_uids_json="$(read_selected_user_uids)"
   fi
-  
-  write_config "$outbound" "$include_uids_json"
+
+  write_config "$outbound" "$user_scope"
+  write_state_file "$user_scope" "$include_uids_json"
   write_service_file
+
+  if [[ "$user_scope" == "selected" ]]; then
+    clear_selected_routing
+    clear_legacy_sing_box_routing
+  else
+    clear_selected_routing
+  fi
 
   run_root systemctl daemon-reload
   run_root systemctl enable sing-box >/dev/null
@@ -733,16 +874,60 @@ configure_vpn() {
       [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://2ip.ru 2>/dev/null || true)"
     fi
 
+    if [[ "$user_scope" == "selected" ]]; then
+      log "VPN config applied. Selected-users mode uses Linux nftables + ip rule by UID."
+    else
+      log "VPN config applied. All users mode is active."
+    fi
+
     if [[ -n "$current_ip" ]]; then
-      log "VPN config applied. All good."
       echo "[INFO] Your current public IP: $current_ip"
     else
-      log "VPN config applied. All good."
       echo "[INFO] Could not detect public IP automatically."
     fi
   else
     die "sing-box failed to start. Run: $(basename "$0") logs"
+  fi
+}
 
+detect_public_ip() {
+  local current_ip
+  current_ip=""
+
+  if command -v curl >/dev/null 2>&1; then
+    current_ip="$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://ifconfig.me 2>/dev/null || true)"
+    [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://2ip.ru 2>/dev/null || true)"
+  fi
+
+  echo "$current_ip"
+}
+
+show_status_summary() {
+  local current_ip mode include_uids users
+
+  current_ip="$(detect_public_ip)"
+  mode="unknown"
+  users=""
+
+  if run_root test -f "$STATE_FILE"; then
+    mode="$(run_root jq -r '.user_scope // "unknown"' "$STATE_FILE")"
+    include_uids="$(run_root jq -c '.include_uids // []' "$STATE_FILE")"
+    if [[ "$include_uids" != "[]" ]]; then
+      users="$(run_root jq -r '.include_uids | map(tostring) | join(", ")' "$STATE_FILE")"
+    fi
+  fi
+
+  echo
+  echo "VPN summary:"
+  if [[ -n "$current_ip" ]]; then
+    echo "  Public IP: $current_ip"
+  else
+    echo "  Public IP: unavailable"
+  fi
+  echo "  Mode: $mode"
+  if [[ -n "$users" ]]; then
+    echo "  Routed UIDs: $users"
   fi
 }
 
@@ -751,7 +936,6 @@ usage() {
   cmd="$(basename "$0")"
   cat <<HELP_EOF
 Usage: ${cmd} <command>
-
 
 Commands:
   configure     Interactive setup (choose VLESS/VLESS+REALITY and provide URL/JSON)
@@ -765,6 +949,7 @@ Commands:
   uninstall     Completely remove sing-box and all configurations
   logs          Follow sing-box logs
   show-config   Print /etc/sing-box/config.json
+  show-state    Print /etc/sing-box/vpnc-state.json
   help          Show this help
 HELP_EOF
 }
@@ -779,7 +964,7 @@ uninstall_vpn() {
   echo "  - /usr/local/bin/makrelbka-vpnc"
   echo
   read -r -p "Are you absolutely sure? Type 'yes' to continue: " confirmation
-  
+
   if [[ "$confirmation" != "yes" ]]; then
     echo "Uninstall cancelled."
     return
@@ -788,20 +973,24 @@ uninstall_vpn() {
   echo "Stopping and disabling sing-box service..."
   run_root systemctl stop sing-box 2>/dev/null || true
   run_root systemctl disable sing-box 2>/dev/null || true
-  
+
+  echo "Clearing nftables runtime rules..."
+  clear_selected_routing
+  clear_legacy_sing_box_routing
+
   echo "Removing systemd service file..."
   run_root rm -f /etc/systemd/system/sing-box.service
   run_root systemctl daemon-reload
-  
+
   echo "Removing sing-box binary..."
   run_root rm -f /usr/local/bin/sing-box
-  
+
   echo "Removing configuration directory..."
   run_root rm -rf /etc/sing-box
-  
+
   echo "Removing manager script..."
   run_root rm -f /usr/local/bin/vpnc /usr/local/bin/makrelbka-vpnc
-  
+
   echo "[SUCCESS] sing-box has been completely uninstalled."
   echo "You may want to reboot your system to clean up any remaining TUN interfaces."
 }
@@ -815,6 +1004,7 @@ main() {
       ;;
     status)
       run_root systemctl status sing-box --no-pager
+      show_status_summary
       ;;
     start)
       run_root systemctl start sing-box
@@ -840,6 +1030,16 @@ main() {
     show-config)
       run_root cat "$CONFIG_FILE"
       ;;
+    show-state)
+      run_root cat "$STATE_FILE"
+      ;;
+    _apply-selected-routing)
+      apply_selected_routing_from_state
+      ;;
+    _clear-selected-routing)
+      clear_selected_routing
+      clear_legacy_sing_box_routing
+      ;;
     help|-h|--help)
       usage
       ;;
@@ -857,10 +1057,8 @@ MANAGER_EOF
   rm -f "$tmp_manager"
 
   log "Installed manager commands: $MANAGER_PATH and $LEGACY_MANAGER_PATH"
-
 }
 
-# Это функция установки (bootstrap)
 bootstrap() {
   local no_configure="0"
   if [[ "${1:-}" == "--no-configure" ]]; then
@@ -883,7 +1081,6 @@ bootstrap() {
   echo "  makrelbka-vpnc configure"
   echo "  makrelbka-vpnc status"
   echo "  makrelbka-vpnc start|stop|restart"
-
   echo
 
   if [[ "$no_configure" == "0" ]]; then
@@ -893,17 +1090,15 @@ bootstrap() {
   fi
 }
 
-# Основная логика
 if [[ $SKIP_BOOTSTRAP -eq 1 ]]; then
   if [[ -f "$MANAGER_PATH" ]]; then
     "$MANAGER_PATH" "$@"
   elif [[ -f "$LEGACY_MANAGER_PATH" ]]; then
     "$LEGACY_MANAGER_PATH" "$@"
   else
-    echo "[ERROR] Manager not found at $MANAGER_PATH or $LEGACY_MANAGER_PATH"
+    echo "[ERROR] Manager not found at $MANAGER_PATH or $LEGACY_MANAGER_PATH" >&2
     exit 1
   fi
 else
   bootstrap "$@"
 fi
-
