@@ -6,8 +6,10 @@ if [[ $# -gt 0 ]] && [[ "$1" != "install" ]] && [[ "$1" != "--no-configure" ]]; 
   SKIP_BOOTSTRAP=1
 fi
 
-SCRIPT_NAME="makrelbka-vpnc"
-MANAGER_PATH="/usr/local/bin/makrelbka-vpnc"
+SCRIPT_NAME="vpnc"
+MANAGER_PATH="/usr/local/bin/vpnc"
+LEGACY_MANAGER_PATH="/usr/local/bin/makrelbka-vpnc"
+
 
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
@@ -108,7 +110,7 @@ install_sing_box() {
   arch="$(detect_arch)"
   log "Detected architecture: $arch"
 
-  target_version="${SING_BOX_VERSION:-1.12.0}"
+  target_version="${SING_BOX_VERSION:-1.12.20}"
 
   if [[ "$target_version" == "latest" ]]; then
     release_json="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
@@ -147,6 +149,7 @@ install_sing_box() {
   [[ -n "$bin_path" ]] || die "sing-box binary was not found in archive"
 
   run_root install -m 0755 "$bin_path" /usr/local/bin/sing-box
+
   rm -rf "$tmp_dir"
   log "Installed sing-box to /usr/local/bin/sing-box"
 }
@@ -506,30 +509,12 @@ select_mode() {
 }
 
 select_user_scope() {
-  local choice
-  while true; do
-    echo >&2
-    echo "Apply VPN for:" >&2
-    echo "  1) All users" >&2
-    echo "  2) Only selected users" >&2
-    read -r -p "Enter number [1-2] (default: 1): " choice
-    choice="${choice:-1}"
-
-    case "$choice" in
-      1)
-        echo "all"
-        return
-        ;;
-      2)
-        echo "selected"
-        return
-        ;;
-      *)
-        echo "Invalid choice" >&2
-        ;;
-    esac
-  done
+  echo >&2
+  echo "Apply VPN for: all users" >&2
+  echo "Selected-users mode is temporarily disabled." >&2
+  echo "all"
 }
+
 
 read_selected_user_uids() {
   local input user uid
@@ -552,7 +537,7 @@ read_selected_user_uids() {
     uids+=("$uid")
   done
 
-  printf '%s\n' "${uids[@]}" | jq -R . | jq -s .
+  printf '%s\n' "${uids[@]}" | jq -R 'tonumber' | jq -s .
 }
 
 select_input_type() {
@@ -756,13 +741,17 @@ configure_vpn() {
       echo "[INFO] Could not detect public IP automatically."
     fi
   else
-    die "sing-box failed to start. Run: makrelbka-vpnc logs"
+    die "sing-box failed to start. Run: $(basename "$0") logs"
+
   fi
 }
 
 usage() {
-  cat <<'HELP_EOF'
-Usage: makrelbka-vpnc <command>
+  local cmd
+  cmd="$(basename "$0")"
+  cat <<HELP_EOF
+Usage: ${cmd} <command>
+
 
 Commands:
   configure     Interactive setup (choose VLESS/VLESS+REALITY and provide URL/JSON)
@@ -786,6 +775,7 @@ uninstall_vpn() {
   echo "  - /usr/local/bin/sing-box"
   echo "  - /etc/sing-box/"
   echo "  - /etc/systemd/system/sing-box.service"
+  echo "  - /usr/local/bin/vpnc"
   echo "  - /usr/local/bin/makrelbka-vpnc"
   echo
   read -r -p "Are you absolutely sure? Type 'yes' to continue: " confirmation
@@ -810,7 +800,7 @@ uninstall_vpn() {
   run_root rm -rf /etc/sing-box
   
   echo "Removing manager script..."
-  run_root rm -f /usr/local/bin/makrelbka-vpnc
+  run_root rm -f /usr/local/bin/vpnc /usr/local/bin/makrelbka-vpnc
   
   echo "[SUCCESS] sing-box has been completely uninstalled."
   echo "You may want to reboot your system to clean up any remaining TUN interfaces."
@@ -841,7 +831,7 @@ main() {
     disable)
       run_root systemctl disable sing-box
       ;;
-    uninstall)                    # <-- ДОБАВЬТЕ ЭТОТ БЛОК
+    uninstall)
       uninstall_vpn
       ;;
     logs)
@@ -863,9 +853,11 @@ main "$@"
 MANAGER_EOF
 
   run_root install -m 0755 "$tmp_manager" "$MANAGER_PATH"
+  run_root ln -sf "$MANAGER_PATH" "$LEGACY_MANAGER_PATH"
   rm -f "$tmp_manager"
 
-  log "Installed manager command: $MANAGER_PATH"
+  log "Installed manager commands: $MANAGER_PATH and $LEGACY_MANAGER_PATH"
+
 }
 
 # Это функция установки (bootstrap)
@@ -883,9 +875,15 @@ bootstrap() {
   log "Bootstrap completed"
   echo
   echo "Use these commands:"
+  echo "  vpnc configure"
+  echo "  vpnc status"
+  echo "  vpnc start|stop|restart"
+  echo
+  echo "Compatibility alias:"
   echo "  makrelbka-vpnc configure"
   echo "  makrelbka-vpnc status"
   echo "  makrelbka-vpnc start|stop|restart"
+
   echo
 
   if [[ "$no_configure" == "0" ]]; then
@@ -897,15 +895,15 @@ bootstrap() {
 
 # Основная логика
 if [[ $SKIP_BOOTSTRAP -eq 1 ]]; then
-  # Если вызваны с командой (uninstall, status и т.д.), 
-  # нужно выполнить команду через установленный менеджер
   if [[ -f "$MANAGER_PATH" ]]; then
     "$MANAGER_PATH" "$@"
+  elif [[ -f "$LEGACY_MANAGER_PATH" ]]; then
+    "$LEGACY_MANAGER_PATH" "$@"
   else
-    echo "[ERROR] Manager not found at $MANAGER_PATH"
+    echo "[ERROR] Manager not found at $MANAGER_PATH or $LEGACY_MANAGER_PATH"
     exit 1
   fi
 else
-  # Если вызваны без команды или с install, выполняем установку
   bootstrap "$@"
 fi
+
