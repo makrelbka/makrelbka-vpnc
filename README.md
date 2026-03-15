@@ -44,3 +44,16 @@ makrelbka-vpnc restart
 makrelbka-vpnc logs
 makrelbka-vpnc show-config
 ```
+
+### or
+
+```bash
+vpnc configure
+vpnc reconfigure
+vpnc status
+vpnc start
+vpnc stop
+vpnc restart
+vpnc logs
+vpnc show-config
+```
