@@ -70,6 +70,8 @@ At runtime:
 
 If a required dependency is missing and the package manager is available, the script tries to install it automatically.
 
+The installer also normalizes `PATH` for regular users and includes common `sbin` directories, so tools like `nft` work correctly on Debian/Ubuntu even when they are installed under `/usr/sbin`.
+
 ## Service / VPN management
 
 ```bash

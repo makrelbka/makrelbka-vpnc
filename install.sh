@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 SKIP_BOOTSTRAP=0
 if [[ $# -gt 0 ]] && [[ "$1" != "install" ]] && [[ "$1" != "--no-configure" ]]; then
   SKIP_BOOTSTRAP=1
@@ -177,6 +179,8 @@ install_manager() {
   cat > "$tmp_manager" <<'MANAGER_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
