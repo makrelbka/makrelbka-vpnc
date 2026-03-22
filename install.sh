@@ -45,11 +45,30 @@ ensure_sudo() {
   fi
 }
 
+install_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_root apt-get update -y
+    run_root apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    run_root dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    run_root yum install -y "$@"
+  elif command -v pacman >/dev/null 2>&1; then
+    run_root pacman -Sy --noconfirm "$@"
+  elif command -v zypper >/dev/null 2>&1; then
+    run_root zypper --non-interactive install "$@"
+  elif command -v apk >/dev/null 2>&1; then
+    run_root apk add --no-cache "$@"
+  else
+    die "Unsupported package manager. Install required dependencies manually."
+  fi
+}
+
 install_dependencies() {
   local missing_cmds=()
   local cmd
 
-  for cmd in curl jq tar nft; do
+  for cmd in curl jq tar nft ip systemctl journalctl find; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing_cmds+=("$cmd")
     fi
@@ -62,20 +81,17 @@ install_dependencies() {
   log "Installing dependencies: ${missing_cmds[*]}"
 
   if command -v apt-get >/dev/null 2>&1; then
-    run_root apt-get update -y
-    run_root apt-get install -y curl jq tar ca-certificates nftables
-  elif command -v dnf >/dev/null 2>&1; then
-    run_root dnf install -y curl jq tar ca-certificates nftables
-  elif command -v yum >/dev/null 2>&1; then
-    run_root yum install -y curl jq tar ca-certificates nftables
+    install_packages curl jq tar ca-certificates nftables iproute2 systemd findutils
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    install_packages curl jq tar ca-certificates nftables iproute systemd findutils
   elif command -v pacman >/dev/null 2>&1; then
-    run_root pacman -Sy --noconfirm curl jq tar ca-certificates nftables
+    install_packages curl jq tar ca-certificates nftables iproute2 systemd findutils
   elif command -v zypper >/dev/null 2>&1; then
-    run_root zypper --non-interactive install curl jq tar ca-certificates nftables
+    install_packages curl jq tar ca-certificates nftables iproute2 systemd findutils
   elif command -v apk >/dev/null 2>&1; then
-    run_root apk add --no-cache curl jq tar ca-certificates nftables
+    install_packages curl jq tar ca-certificates nftables iproute2 findutils
   else
-    die "Unsupported package manager. Install curl, jq, tar and nftables manually."
+    die "Unsupported package manager. Install curl, jq, tar, nftables, iproute2 and systemd manually."
   fi
 }
 
@@ -200,6 +216,56 @@ run_root() {
     "$SUDO" "$@"
   else
     "$@"
+  fi
+}
+
+install_packages() {
+  if command -v apt-get >/dev/null 2>&1; then
+    run_root apt-get update -y
+    run_root apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    run_root dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    run_root yum install -y "$@"
+  elif command -v pacman >/dev/null 2>&1; then
+    run_root pacman -Sy --noconfirm "$@"
+  elif command -v zypper >/dev/null 2>&1; then
+    run_root zypper --non-interactive install "$@"
+  elif command -v apk >/dev/null 2>&1; then
+    run_root apk add --no-cache "$@"
+  else
+    die "Unsupported package manager. Install required runtime dependencies manually."
+  fi
+}
+
+ensure_runtime_dependencies() {
+  local missing_cmds=()
+  local cmd
+
+  for cmd in jq nft ip find install mktemp sed grep id curl systemctl journalctl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_cmds+=("$cmd")
+    fi
+  done
+
+  if (( ${#missing_cmds[@]} == 0 )); then
+    return
+  fi
+
+  warn "Missing runtime dependencies: ${missing_cmds[*]}"
+
+  if command -v apt-get >/dev/null 2>&1; then
+    install_packages curl ca-certificates jq nftables iproute2 systemd findutils coreutils grep sed util-linux
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    install_packages curl ca-certificates jq nftables iproute systemd findutils coreutils grep sed util-linux
+  elif command -v pacman >/dev/null 2>&1; then
+    install_packages curl ca-certificates jq nftables iproute2 systemd findutils coreutils grep sed util-linux
+  elif command -v zypper >/dev/null 2>&1; then
+    install_packages curl ca-certificates jq nftables iproute2 systemd findutils coreutils grep sed util-linux
+  elif command -v apk >/dev/null 2>&1; then
+    install_packages curl ca-certificates jq nftables iproute2 findutils coreutils grep sed util-linux
+  else
+    die "Unsupported package manager. Install runtime dependencies manually: ${missing_cmds[*]}"
   fi
 }
 
@@ -807,6 +873,7 @@ NFT_EOF
 }
 
 apply_selected_routing_from_state() {
+  ensure_runtime_dependencies
   ensure_cmd jq nft ip
 
   if ! run_root test -f "$STATE_FILE"; then
@@ -841,6 +908,7 @@ apply_selected_routing_from_state() {
 }
 
 configure_vpn() {
+  ensure_runtime_dependencies
   ensure_cmd jq systemctl sing-box id nft ip
 
   local mode input_type user_scope outbound uri json_payload include_uids_json
@@ -911,6 +979,8 @@ detect_public_ip() {
   local current_ip
   current_ip=""
 
+  ensure_runtime_dependencies
+
   if command -v curl >/dev/null 2>&1; then
     current_ip="$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
     [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://ifconfig.me 2>/dev/null || true)"
@@ -972,6 +1042,7 @@ HELP_EOF
 }
 
 uninstall_vpn() {
+  ensure_runtime_dependencies
   echo "[WARN] This will completely remove sing-box and all its configurations!"
   echo "[WARN] The following will be deleted:"
   echo "  - /usr/local/bin/sing-box"
@@ -997,6 +1068,7 @@ uninstall_vpn() {
 
   echo "Removing systemd service file..."
   run_root rm -f /etc/systemd/system/sing-box.service
+  run_root rm -rf /etc/systemd/system/sing-box.service.d
   run_root systemctl daemon-reload
 
   echo "Removing sing-box binary..."
@@ -1007,7 +1079,6 @@ uninstall_vpn() {
 
   echo "Removing manager script..."
   run_root rm -f /usr/local/bin/vpnc /usr/local/bin/makrelbka-vpnc
-  run_root rm -rf /etc/systemd/system/sing-box.service.d
 
   echo "[SUCCESS] sing-box has been completely uninstalled."
   echo "You may want to reboot your system to clean up any remaining TUN interfaces."
@@ -1021,40 +1092,50 @@ main() {
       configure_vpn
       ;;
     status)
+      ensure_runtime_dependencies
       run_root systemctl status sing-box --no-pager
       show_status_summary
       ;;
     start)
+      ensure_runtime_dependencies
       run_root systemctl start sing-box
       ;;
     stop)
+      ensure_runtime_dependencies
       run_root systemctl stop sing-box
       ;;
     restart)
+      ensure_runtime_dependencies
       run_root systemctl restart sing-box
       ;;
     enable)
+      ensure_runtime_dependencies
       run_root systemctl enable sing-box
       ;;
     disable)
+      ensure_runtime_dependencies
       run_root systemctl disable sing-box
       ;;
     uninstall)
       uninstall_vpn
       ;;
     logs)
+      ensure_runtime_dependencies
       run_root journalctl -u sing-box -f
       ;;
     show-config)
+      ensure_runtime_dependencies
       run_root cat "$CONFIG_FILE"
       ;;
     show-state)
+      ensure_runtime_dependencies
       run_root cat "$STATE_FILE"
       ;;
     _apply-selected-routing)
       apply_selected_routing_from_state
       ;;
     _clear-selected-routing)
+      ensure_runtime_dependencies
       clear_selected_routing
       clear_legacy_sing_box_routing
       ;;
