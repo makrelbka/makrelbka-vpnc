@@ -515,6 +515,21 @@ select_mode() {
   done
 }
 
+wait_for_interface() {
+  local ifname="$1"
+  local timeout="${2:-15}"
+  local i
+
+  for i in $(seq 1 "$timeout"); do
+    if run_root ip link show "$ifname" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
 select_user_scope() {
   local choice
   while true; do
@@ -618,7 +633,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-ExecStartPost=-/usr/local/bin/vpnc _apply-selected-routing
+ExecStartPost=/usr/local/bin/vpnc _apply-selected-routing
 ExecStopPost=-/usr/local/bin/vpnc _clear-selected-routing
 Restart=always
 RestartSec=3
@@ -636,7 +651,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-ExecStartPost=-/usr/local/bin/vpnc _apply-selected-routing
+ExecStartPost=/usr/local/bin/vpnc _apply-selected-routing
 ExecStopPost=-/usr/local/bin/vpnc _clear-selected-routing
 Restart=always
 RestartSec=3
@@ -814,6 +829,8 @@ apply_selected_routing_from_state() {
     die "Selected-users mode requested, but include_uids is empty in $STATE_FILE"
   fi
 
+  wait_for_interface "sbtun" 15 || die "sbtun interface did not appear in time"
+
   write_custom_nft_file "$include_uids_json"
   clear_selected_routing
   clear_legacy_sing_box_routing
@@ -990,6 +1007,7 @@ uninstall_vpn() {
 
   echo "Removing manager script..."
   run_root rm -f /usr/local/bin/vpnc /usr/local/bin/makrelbka-vpnc
+  run_root rm -rf /etc/systemd/system/sing-box.service.d
 
   echo "[SUCCESS] sing-box has been completely uninstalled."
   echo "You may want to reboot your system to clean up any remaining TUN interfaces."
