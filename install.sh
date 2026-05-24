@@ -306,11 +306,27 @@ parse_query_map() {
   done
 }
 
-build_outbound_from_uri() {
-  local uri="$1"
-  local mode="$2"
+decode_base64_urlsafe() {
+  local data="$1"
+  local rem
 
-  [[ "$uri" == vless://* ]] || die "Only vless:// URI is supported"
+  data="${data//-/+}"
+  data="${data//_/\/}"
+  rem=$(( ${#data} % 4 ))
+  if [[ $rem -eq 2 ]]; then
+    data="${data}=="
+  elif [[ $rem -eq 3 ]]; then
+    data="${data}="
+  elif [[ $rem -eq 1 ]]; then
+    die "Invalid base64 payload"
+  fi
+
+  printf '%s' "$data" | base64 -d 2>/dev/null || die "Failed to decode base64 payload"
+}
+
+build_vless_outbound_from_uri() {
+  local uri="$1"
+  local mode="${2:-}"
 
   local no_scheme="${uri#vless://}"
   [[ "$no_scheme" == *"@"* ]] || die "Invalid URI: missing @"
@@ -366,7 +382,7 @@ build_outbound_from_uri() {
     --arg flow "$flow" \
     '{
       type: "vless",
-      tag: "vless-out",
+      tag: "proxy-out",
       server: $server,
       server_port: $server_port,
       uuid: $uuid
@@ -445,6 +461,93 @@ build_outbound_from_uri() {
   echo "$outbound" | jq -c .
 }
 
+build_shadowsocks_outbound_from_uri() {
+  local uri="$1"
+  local no_scheme="${uri#ss://}"
+  local fragment=""
+  local query=""
+  local host_port=""
+  local userinfo=""
+  local decoded=""
+  local method=""
+  local password=""
+  local server=""
+  local port=""
+
+  if [[ "$no_scheme" == *"#"* ]]; then
+    fragment="${no_scheme#*#}"
+    no_scheme="${no_scheme%%#*}"
+  fi
+
+  if [[ "$no_scheme" == *"?"* ]]; then
+    query="${no_scheme#*\?}"
+    no_scheme="${no_scheme%%\?*}"
+  fi
+
+  if [[ "$no_scheme" == *"@"* ]]; then
+    userinfo="${no_scheme%%@*}"
+    host_port="${no_scheme#*@}"
+    if [[ "$userinfo" != *:* ]]; then
+      userinfo="$(decode_base64_urlsafe "$userinfo")"
+    fi
+  else
+    decoded="$(decode_base64_urlsafe "$no_scheme")"
+    [[ "$decoded" == *"@"* ]] || die "Invalid ss:// URI"
+    userinfo="${decoded%%@*}"
+    host_port="${decoded#*@}"
+  fi
+
+  [[ "$userinfo" == *:* ]] || die "Invalid ss:// credentials"
+  method="${userinfo%%:*}"
+  password="${userinfo#*:}"
+
+  if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:(.+)$ ]]; then
+    server="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  elif [[ "$host_port" == *":"* ]]; then
+    server="${host_port%:*}"
+    port="${host_port##*:}"
+  else
+    die "Invalid ss:// URI: missing host:port"
+  fi
+
+  [[ -n "$method" ]] || die "Shadowsocks method is missing"
+  [[ -n "$password" ]] || die "Shadowsocks password is missing"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid port in ss:// URI: $port"
+
+  jq -cn \
+    --arg server "$server" \
+    --argjson server_port "$port" \
+    --arg method "$method" \
+    --arg password "$password" '
+    {
+      type: "shadowsocks",
+      tag: "proxy-out",
+      server: $server,
+      server_port: $server_port,
+      method: $method,
+      password: $password
+    }
+  '
+}
+
+build_outbound_from_uri() {
+  local uri="$1"
+  local mode="${2:-}"
+
+  case "$uri" in
+    vless://*)
+      build_vless_outbound_from_uri "$uri" "$mode"
+      ;;
+    ss://*)
+      build_shadowsocks_outbound_from_uri "$uri"
+      ;;
+    *)
+      die "Only vless:// and ss:// URIs are supported"
+      ;;
+  esac
+}
+
 build_outbound_from_xray_json() {
   local json="$1"
 
@@ -454,7 +557,7 @@ build_outbound_from_xray_json() {
     | $v.users[0] as $u
     | {
         type: "vless",
-        tag: "vless-out",
+        tag: "proxy-out",
         server: $v.address,
         server_port: ($v.port | tonumber),
         uuid: $u.id
@@ -544,7 +647,7 @@ build_outbound_from_json() {
 
   outbound="$(echo "$outbound" | jq -c '
     .type = "vless"
-    | .tag = "vless-out"
+    | .tag = "proxy-out"
     | .server_port = (.server_port | tonumber)
   ')"
 
@@ -583,6 +686,15 @@ select_mode() {
         ;;
     esac
   done
+}
+
+detect_uri_scheme() {
+  local uri="$1"
+  case "$uri" in
+    vless://*) echo "vless" ;;
+    ss://*) echo "ss" ;;
+    *) echo "unknown" ;;
+  esac
 }
 
 wait_for_interface() {
@@ -671,7 +783,7 @@ select_input_type() {
   while true; do
     echo >&2
     echo "Config input format:" >&2
-    echo "  1) VLESS URL (vless://...)" >&2
+    echo "  1) VPN URL (vless://... or ss://...)" >&2
     echo "  2) JSON config" >&2
     read -r -p "Enter number [1-2] (default: 1): " choice
     choice="${choice:-1}"
@@ -756,7 +868,7 @@ write_state_file() {
 write_config() {
   local outbound="$1"
   local user_scope="$2"
-  local auto_route_json auto_redirect_json tmp_config backup_file
+  local auto_route_json auto_redirect_json tmp_config backup_file outbound_tag
 
   auto_route_json=false
   auto_redirect_json=false
@@ -766,9 +878,11 @@ write_config() {
   fi
 
   tmp_config="$(mktemp)"
+  outbound_tag="$(jq -r '.tag' <<<"$outbound")"
 
   jq -n \
     --argjson outbound "$outbound" \
+    --arg outbound_tag "$outbound_tag" \
     --argjson auto_route "$auto_route_json" \
     --argjson auto_redirect "$auto_redirect_json" '
     {
@@ -811,7 +925,7 @@ write_config() {
           { action: "sniff" },
           { protocol: "dns", action: "hijack-dns" }
         ],
-        final: "vless-out"
+        final: $outbound_tag
       }
     }
   ' > "$tmp_config"
@@ -915,18 +1029,21 @@ configure_vpn() {
   ensure_runtime_dependencies
   ensure_cmd jq systemctl sing-box id nft ip
 
-  local mode input_type user_scope outbound uri json_payload include_uids_json
+  local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme
 
-  mode="$(select_mode)"
   input_type="$(select_input_type)"
   user_scope="$(select_user_scope)"
   include_uids_json='[]'
+  mode=""
 
   if [[ "$input_type" == "url" ]]; then
     echo
-    read -r -p "Paste VLESS URL: " uri
-    outbound="$(build_outbound_from_uri "$uri" "$mode")"
+    read -r -p "Paste VPN URL: " uri
+    uri_scheme="$(detect_uri_scheme "$uri")"
+    [[ "$uri_scheme" != "unknown" ]] || die "Unsupported URI scheme. Expected vless:// or ss://"
+    outbound="$(build_outbound_from_uri "$uri")"
   else
+    mode="$(select_mode)"
     json_payload="$(read_json_payload)"
     outbound="$(build_outbound_from_json "$json_payload" "$mode")"
   fi
@@ -1029,7 +1146,7 @@ usage() {
 Usage: ${cmd} <command>
 
 Commands:
-  configure     Interactive setup (choose VLESS/VLESS+REALITY and provide URL/JSON)
+  configure     Interactive setup (URL: vless:// or ss://, or JSON for VLESS)
   reconfigure   Same as configure
   status        Show service status
   start         Start VPN service

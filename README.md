@@ -13,6 +13,7 @@ Interactive installer for `sing-box` with service management.
   - `VLESS + REALITY`
 - asks input format:
   - `vless://` URL
+  - `ss://` URL
   - JSON config
 - converts input into `/etc/sing-box/config.json`;
 - supports full-tunnel mode or selected-users mode via TUN + route rules;
@@ -20,6 +21,15 @@ Interactive installer for `sing-box` with service management.
 - enables service autostart and restarts it.
 
 Default installed `sing-box` version is `1.12.20`.
+
+## Protocol support
+
+URL input supports:
+
+- `vless://`
+- `ss://`
+
+JSON input is still intended for VLESS-style configs.
 
 ## Supported systems
 
@@ -51,6 +61,29 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makrelbka/makrelbka-vpnc/mai
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/makrelbka/makrelbka-vpnc/main/install.sh) --no-configure
 ```
+
+## Updating an existing device
+
+If the device already has `vpnc` / `makrelbka-vpnc` installed and you only need the newer manager logic:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/makrelbka/makrelbka-vpnc/main/install.sh) --no-configure
+vpnc reconfigure
+```
+
+For a local checkout, the same can be done with:
+
+```bash
+bash ./install.sh --no-configure
+vpnc reconfigure
+```
+
+When reconfiguring with the new version:
+
+- choose `VPN URL`
+- paste either:
+  - `vless://...`
+  - `ss://...`
 
 ## What gets checked automatically
 
