@@ -193,6 +193,19 @@ SELECTED_MARK_NFT="0x00002023"
 SELECTED_ROUTE_TABLE="10023"
 SELECTED_RULE_PREF="8990"
 
+RULES_FILE="${CONFIG_DIR}/vpnc-rules.json"
+SUBSCRIPTION_STATE_FILE="${CONFIG_DIR}/vpnc-subscription.json"
+CLASH_UI_DIR="${CONFIG_DIR}/ui"
+# Default IP:port suggested for the dashboard/API prompt (the Wi-Fi hotspot's own
+# address, see wlan0-ap.service). Overridable via env var; always confirmable/editable
+# interactively when the dashboard is enabled during configure/subscribe.
+CLASH_API_BIND="${VPNC_CLASH_API_BIND:-192.168.77.2:9090}"
+# Local path or URL to a rules JSON ({"rules": [...]}) to seed $RULES_FILE from on first
+# use. Neither is required — with no seed, rules start out empty and can be built up
+# with `rules edit`/`rules toggle`.
+RULES_SEED_PATH="${VPNC_RULES_SEED_PATH:-}"
+RULES_SEED_URL="${VPNC_RULES_SEED_URL:-}"
+
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
   if ! command -v sudo >/dev/null 2>&1; then
@@ -203,7 +216,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 log() {
-  echo "[INFO] $*"
+  echo "[INFO] $*" >&2
 }
 
 warn() {
@@ -246,7 +259,7 @@ ensure_runtime_dependencies() {
   local missing_cmds=()
   local cmd
 
-  for cmd in jq nft ip find install mktemp sed grep id curl systemctl journalctl; do
+  for cmd in jq nft ip find install mktemp sed grep id curl systemctl journalctl base64; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing_cmds+=("$cmd")
     fi
@@ -785,7 +798,8 @@ select_input_type() {
     echo "Config input format:" >&2
     echo "  1) VPN URL (vless://... or ss://...)" >&2
     echo "  2) JSON config" >&2
-    read -r -p "Enter number [1-2] (default: 1): " choice
+    echo "  3) Subscription URL (multiple servers)" >&2
+    read -r -p "Enter number [1-3] (default: 1): " choice
     choice="${choice:-1}"
 
     case "$choice" in
@@ -797,6 +811,10 @@ select_input_type() {
         echo "json"
         return
         ;;
+      3)
+        echo "subscription"
+        return
+        ;;
       *)
         echo "Invalid choice" >&2
         ;;
@@ -804,12 +822,45 @@ select_input_type() {
   done
 }
 
+read_subscription_url() {
+  local url
+  echo >&2
+  read -r -p "Paste subscription URL: " url
+  [[ -n "$url" ]] || die "Subscription URL is required"
+  echo "$url"
+}
+
+select_dashboard_enabled() {
+  local choice
+  echo >&2
+  read -r -p "Enable web dashboard (Clash-compatible UI)? [y/N]: " choice
+  case "$choice" in
+    y|Y|yes|Yes|YES)
+      echo "true"
+      ;;
+    *)
+      echo "false"
+      ;;
+  esac
+}
+
+select_clash_api_bind() {
+  local input
+  echo >&2
+  read -r -p "Dashboard bind address [IP:port] (default: ${CLASH_API_BIND}): " input
+  if [[ -n "$input" ]]; then
+    echo "$input"
+  else
+    echo "$CLASH_API_BIND"
+  fi
+}
+
 write_service_file() {
   if [[ -n "$SUDO" ]]; then
     $SUDO tee "$SERVICE_FILE" >/dev/null <<'UNIT_EOF'
 [Unit]
 Description=sing-box
-After=network-online.target
+After=network-online.target wlan0-ap.service
 Wants=network-online.target
 
 [Service]
@@ -827,7 +878,7 @@ UNIT_EOF
     cat > "$SERVICE_FILE" <<'UNIT_EOF'
 [Unit]
 Description=sing-box
-After=network-online.target
+After=network-online.target wlan0-ap.service
 Wants=network-online.target
 
 [Service]
@@ -847,16 +898,22 @@ UNIT_EOF
 write_state_file() {
   local user_scope="$1"
   local include_uids_json="${2:-[]}"
+  local dashboard_enabled="${3:-false}"
+  local clash_api_bind="${4:-$CLASH_API_BIND}"
   local tmp_state
 
   tmp_state="$(mktemp)"
 
   jq -n \
     --arg user_scope "$user_scope" \
-    --argjson include_uids "$include_uids_json" '
+    --argjson include_uids "$include_uids_json" \
+    --argjson dashboard_enabled "$dashboard_enabled" \
+    --arg clash_api_bind "$clash_api_bind" '
     {
       user_scope: $user_scope,
-      include_uids: $include_uids
+      include_uids: $include_uids,
+      dashboard_enabled: $dashboard_enabled,
+      clash_api_bind: $clash_api_bind
     }
   ' > "$tmp_state"
 
@@ -868,6 +925,7 @@ write_state_file() {
 write_config() {
   local outbound="$1"
   local user_scope="$2"
+  local dashboard_enabled="${3:-false}"
   local auto_route_json auto_redirect_json tmp_config backup_file outbound_tag
 
   auto_route_json=false
@@ -884,7 +942,10 @@ write_config() {
     --argjson outbound "$outbound" \
     --arg outbound_tag "$outbound_tag" \
     --argjson auto_route "$auto_route_json" \
-    --argjson auto_redirect "$auto_redirect_json" '
+    --argjson auto_redirect "$auto_redirect_json" \
+    --argjson dashboard_enabled "$dashboard_enabled" \
+    --arg clash_bind "$CLASH_API_BIND" \
+    --arg clash_ui_dir "$CLASH_UI_DIR" '
     {
       log: { level: "info" },
       dns: {
@@ -928,9 +989,31 @@ write_config() {
         final: $outbound_tag
       }
     }
+    + (
+      if $dashboard_enabled then
+        {
+          experimental: {
+            clash_api: {
+              external_controller: $clash_bind,
+              external_ui: $clash_ui_dir,
+              external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+              external_ui_download_detour: "direct",
+              secret: "",
+              default_mode: "rule"
+            }
+          }
+        }
+      else
+        {}
+      end
+    )
   ' > "$tmp_config"
 
   run_root install -d -m 0755 "$CONFIG_DIR"
+
+  if [[ "$dashboard_enabled" == "true" ]]; then
+    run_root install -d -m 0755 "$CLASH_UI_DIR"
+  fi
 
   if run_root test -f "$CONFIG_FILE"; then
     backup_file="/etc/sing-box/config.backup-$(date +%Y%m%d-%H%M%S).json"
@@ -1029,9 +1112,19 @@ configure_vpn() {
   ensure_runtime_dependencies
   ensure_cmd jq systemctl sing-box id nft ip
 
-  local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme
+  local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme dashboard_enabled sub_url
 
   input_type="$(select_input_type)"
+
+  if [[ "$input_type" == "subscription" ]]; then
+    ensure_cmd curl base64
+    sub_url="$(read_subscription_url)"
+    dashboard_enabled="$(select_dashboard_enabled)"
+    [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
+    configure_subscription "$sub_url" "$dashboard_enabled"
+    return
+  fi
+
   user_scope="$(select_user_scope)"
   include_uids_json='[]'
   mode=""
@@ -1052,8 +1145,11 @@ configure_vpn() {
     include_uids_json="$(read_selected_user_uids)"
   fi
 
-  write_config "$outbound" "$user_scope"
-  write_state_file "$user_scope" "$include_uids_json"
+  dashboard_enabled="$(select_dashboard_enabled)"
+  [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
+
+  write_config "$outbound" "$user_scope" "$dashboard_enabled"
+  write_state_file "$user_scope" "$include_uids_json" "$dashboard_enabled" "$CLASH_API_BIND"
   write_service_file
 
   if [[ "$user_scope" == "selected" ]]; then
@@ -1096,6 +1192,377 @@ configure_vpn() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Subscription mode: fetch a subscription URL, turn every entry into a
+# sing-box outbound (reusing build_outbound_from_uri), group them into a
+# selector ("proxy") + urltest ("auto") pair, and optionally (only if the
+# caller opted in) enable the built-in clash_api + external_ui dashboard
+# (metacubexd) so servers/ping/speed/pick can be managed from a browser
+# instead of the CLI.
+# ---------------------------------------------------------------------------
+
+decode_subscription_text() {
+  local raw="$1" decoded
+
+  if grep -qE '^(vless|ss|vmess|trojan)://' <<<"$raw"; then
+    printf '%s' "$raw"
+    return
+  fi
+
+  decoded="$(tr -d '[:space:]' <<<"$raw" | base64 -d 2>/dev/null || true)"
+  if [[ -n "$decoded" ]] && grep -qE '^(vless|ss|vmess|trojan)://' <<<"$decoded"; then
+    printf '%s' "$decoded"
+    return
+  fi
+
+  die "Subscription format is not recognized (expected plain vless/ss URIs or a base64 blob of them)"
+}
+
+fetch_subscription_url() {
+  local url="$1" raw
+  raw="$(curl -fsSL --max-time 20 "$url")" || die "Could not download subscription: $url"
+  decode_subscription_text "$raw"
+}
+
+# Populates globals SUBSCRIPTION_TAGS_JSON / SUBSCRIPTION_PROXIES_JSON.
+build_outbounds_from_subscription() {
+  local text="$1"
+  local -a tags=()
+  local -a items=()
+  declare -A seen=()
+  local line frag name base n outbound scheme
+
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && continue
+
+    scheme="$(detect_uri_scheme "$line")"
+    if [[ "$scheme" == "unknown" ]]; then
+      warn "Skipped subscription line (unknown scheme)"
+      continue
+    fi
+
+    if [[ "$line" == *"#"* ]]; then
+      name="$(url_decode "${line#*#}")"
+    else
+      name="node-$(( ${#items[@]} + 1 ))"
+    fi
+    [[ -n "$name" ]] || name="node-$(( ${#items[@]} + 1 ))"
+
+    base="$name"
+    n=2
+    while [[ -n "${seen[$name]:-}" ]]; do
+      name="${base} #${n}"
+      n=$((n + 1))
+    done
+    seen["$name"]=1
+
+    if ! outbound="$(build_outbound_from_uri "$line" "" 2>/dev/null)"; then
+      warn "Skipped node (could not parse): $name"
+      continue
+    fi
+
+    outbound="$(jq -c --arg tag "$name" '.tag = $tag' <<<"$outbound")"
+    tags+=("$name")
+    items+=("$outbound")
+  done <<<"$text"
+
+  [[ ${#items[@]} -gt 0 ]] || die "Could not parse any server from the subscription"
+
+  SUBSCRIPTION_TAGS_JSON="$(printf '%s\n' "${tags[@]}" | jq -R . | jq -s .)"
+  SUBSCRIPTION_PROXIES_JSON="$(printf '%s\n' "${items[@]}" | jq -s .)"
+}
+
+seed_rules_file_if_missing() {
+  run_root test -f "$RULES_FILE" && return
+
+  run_root install -d -m 0755 "$CONFIG_DIR"
+  local tmp source_desc
+  tmp="$(mktemp)"
+
+  if [[ -n "$RULES_SEED_PATH" ]]; then
+    [[ -f "$RULES_SEED_PATH" ]] || die "VPNC_RULES_SEED_PATH is set but file does not exist: $RULES_SEED_PATH"
+    cp "$RULES_SEED_PATH" "$tmp"
+    source_desc="$RULES_SEED_PATH"
+  elif [[ -n "$RULES_SEED_URL" ]]; then
+    curl -fsSL --max-time 20 "$RULES_SEED_URL" -o "$tmp" || die "Could not download rules seed: $RULES_SEED_URL"
+    source_desc="$RULES_SEED_URL"
+  else
+    printf '%s\n' '{"rules": []}' > "$tmp"
+    source_desc=""
+  fi
+
+  jq -e '.rules and (.rules | type == "array")' "$tmp" >/dev/null 2>&1 \
+    || die "Rules seed is not valid JSON of the form {\"rules\": [...]}: ${source_desc:-(built-in empty default)}"
+
+  run_root install -m 0644 "$tmp" "$RULES_FILE"
+  rm -f "$tmp"
+
+  if [[ -n "$source_desc" ]]; then
+    log "Created rules file from seed ($source_desc): $RULES_FILE"
+    warn "process_name/port rules only match traffic that originates on this box itself (sing-box runs on the router, not on client devices) — domain/ip_cidr rules still work normally for hotspot clients."
+  else
+    log "Created empty rules file: $RULES_FILE (add groups with: $(basename "$0") rules edit, or set VPNC_RULES_SEED_PATH/VPNC_RULES_SEED_URL before first use)"
+  fi
+}
+
+compile_custom_rules() {
+  seed_rules_file_if_missing
+
+  run_root jq -c '
+    def cond_keys: ["domain","domain_suffix","domain_keyword","domain_regex","ip_cidr","port","port_range","process_name","package_name","network","protocol"];
+    [
+      .rules[]
+      | select(.switch == true)
+      | . as $r
+      | (cond_keys | map(select($r[.] != null and ($r[.] | length) > 0))) as $keys
+      | select(($keys | length) > 0)
+      | if ($keys | length) == 1 then
+          { ($keys[0]): $r[$keys[0]], outbound: $r.outbound }
+        else
+          {
+            type: "logical",
+            mode: (if $r.or == false then "and" else "or" end),
+            rules: [ $keys[] as $k | { ($k): $r[$k] } ],
+            outbound: $r.outbound
+          }
+        end
+    ]
+  ' "$RULES_FILE"
+}
+
+write_subscription_config() {
+  local dashboard_enabled="${1:-false}"
+  local tmp_config backup_file custom_rules_json
+
+  custom_rules_json="$(compile_custom_rules)"
+  tmp_config="$(mktemp)"
+
+  jq -n \
+    --argjson proxies "$SUBSCRIPTION_PROXIES_JSON" \
+    --argjson tags "$SUBSCRIPTION_TAGS_JSON" \
+    --argjson custom_rules "$custom_rules_json" \
+    --argjson dashboard_enabled "$dashboard_enabled" \
+    --arg clash_bind "$CLASH_API_BIND" \
+    --arg clash_ui_dir "$CLASH_UI_DIR" \
+    '
+    {
+      log: { level: "info" },
+      dns: {
+        servers: [
+          { type: "tls", tag: "cloudflare", server: "1.1.1.1" },
+          { type: "tls", tag: "google", server: "8.8.8.8" }
+        ],
+        final: "cloudflare"
+      },
+      inbounds: [
+        {
+          type: "tun",
+          tag: "tun-in",
+          interface_name: "sbtun",
+          address: ["198.18.0.1/30"],
+          auto_route: true,
+          auto_redirect: true,
+          strict_route: true,
+          mtu: 1500,
+          stack: "system"
+        }
+      ],
+      outbounds: (
+        [{ type: "selector", tag: "proxy", outbounds: (["auto"] + $tags + ["direct"]), default: "auto" }]
+        + [{ type: "urltest", tag: "auto", outbounds: $tags, url: "https://www.gstatic.com/generate_204", interval: "3m", tolerance: 50 }]
+        + $proxies
+        + [{ type: "direct", tag: "direct" }]
+      ),
+      route: {
+        auto_detect_interface: true,
+        default_domain_resolver: "cloudflare",
+        rules: ([{ action: "sniff" }, { protocol: "dns", action: "hijack-dns" }] + $custom_rules),
+        final: "proxy"
+      }
+    }
+    + (
+      if $dashboard_enabled then
+        {
+          experimental: {
+            clash_api: {
+              external_controller: $clash_bind,
+              external_ui: $clash_ui_dir,
+              external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+              external_ui_download_detour: "direct",
+              secret: "",
+              default_mode: "rule"
+            }
+          }
+        }
+      else
+        {}
+      end
+    )
+    ' > "$tmp_config"
+
+  run_root install -d -m 0755 "$CONFIG_DIR"
+
+  if [[ "$dashboard_enabled" == "true" ]]; then
+    run_root install -d -m 0755 "$CLASH_UI_DIR"
+  fi
+
+  if run_root test -f "$CONFIG_FILE"; then
+    backup_file="/etc/sing-box/config.backup-$(date +%Y%m%d-%H%M%S).json"
+    run_root cp "$CONFIG_FILE" "$backup_file"
+    log "Previous config backup: $backup_file"
+  fi
+
+  run_root install -m 0600 "$tmp_config" "$CONFIG_FILE"
+  rm -f "$tmp_config"
+}
+
+# Shared by configure_vpn's "subscription" input type and the standalone
+# `subscribe` command. dashboard_enabled must already be decided by the
+# caller (interactively, or carried over from a previously saved
+# subscription) — it is never turned on implicitly.
+configure_subscription() {
+  local url="$1"
+  local dashboard_enabled="${2:-false}"
+
+  ensure_runtime_dependencies
+  ensure_cmd jq systemctl sing-box curl base64
+
+  log "Downloading subscription..."
+  local text server_count
+  text="$(fetch_subscription_url "$url")"
+
+  build_outbounds_from_subscription "$text"
+  server_count="$(jq 'length' <<<"$SUBSCRIPTION_TAGS_JSON")"
+  log "Parsed servers: $server_count"
+
+  write_subscription_config "$dashboard_enabled"
+  write_service_file
+
+  local tmp_state
+  tmp_state="$(mktemp)"
+  jq -n \
+    --arg url "$url" \
+    --argjson count "$server_count" \
+    --arg fetched_at "$(date -Is)" \
+    --argjson dashboard_enabled "$dashboard_enabled" \
+    --arg clash_api_bind "$CLASH_API_BIND" \
+    '{url: $url, proxy_count: $count, fetched_at: $fetched_at, dashboard_enabled: $dashboard_enabled, clash_api_bind: $clash_api_bind}' > "$tmp_state"
+  run_root install -d -m 0755 "$CONFIG_DIR"
+  run_root install -m 0600 "$tmp_state" "$SUBSCRIPTION_STATE_FILE"
+  rm -f "$tmp_state"
+
+  # Subscription mode is always full-tunnel; drop any leftover selected-users state/rules.
+  run_root rm -f "$STATE_FILE"
+  clear_selected_routing
+  clear_legacy_sing_box_routing
+  remove_custom_nft_files
+
+  run_root systemctl daemon-reload
+  run_root systemctl enable sing-box >/dev/null
+  run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE"
+  run_root systemctl restart sing-box
+  sleep 2
+
+  if run_root systemctl is-active --quiet sing-box; then
+    log "Subscription applied ($server_count servers)."
+    if [[ "$dashboard_enabled" == "true" ]]; then
+      echo "[INFO] Dashboard: http://${CLASH_API_BIND}/ui/ (reachable only from ${CLASH_API_BIND%%:*})"
+    else
+      echo "[INFO] Dashboard is disabled. Enable it via: $(basename "$0") reconfigure"
+    fi
+  else
+    die "sing-box failed to start. Run: $(basename "$0") logs"
+  fi
+}
+
+# `vpnc subscribe [url]` — refreshes a previously saved subscription (reusing
+# its saved dashboard preference) or, given a fresh URL with no prior
+# subscription on file, asks once whether to enable the dashboard.
+subscribe_vpn() {
+  ensure_runtime_dependencies
+  ensure_cmd jq systemctl sing-box curl base64
+
+  local url="${1:-}" dashboard_enabled="false"
+  local have_state="0"
+  run_root test -f "$SUBSCRIPTION_STATE_FILE" && have_state="1"
+
+  if [[ -z "$url" ]]; then
+    [[ "$have_state" == "1" ]] || die "No saved subscription. Usage: $(basename "$0") subscribe <url>"
+    url="$(run_root jq -r '.url // empty' "$SUBSCRIPTION_STATE_FILE")"
+    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$SUBSCRIPTION_STATE_FILE")"
+    CLASH_API_BIND="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$SUBSCRIPTION_STATE_FILE")"
+    [[ -n "$url" ]] || die "No saved subscription. Usage: $(basename "$0") subscribe <url>"
+  elif [[ "$have_state" == "1" ]]; then
+    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$SUBSCRIPTION_STATE_FILE")"
+    CLASH_API_BIND="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$SUBSCRIPTION_STATE_FILE")"
+  else
+    dashboard_enabled="$(select_dashboard_enabled)"
+    [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
+  fi
+
+  configure_subscription "$url" "$dashboard_enabled"
+}
+
+cmd_rules_edit() {
+  seed_rules_file_if_missing
+  local editor="${EDITOR:-nano}"
+  local tmp
+  tmp="$(mktemp)"
+  run_root cat "$RULES_FILE" > "$tmp"
+  "$editor" "$tmp"
+  jq -e . "$tmp" >/dev/null 2>&1 || die "Invalid JSON, changes were not saved"
+  run_root install -m 0644 "$tmp" "$RULES_FILE"
+  rm -f "$tmp"
+  log "Rules saved. Apply with: $(basename "$0") rules apply"
+}
+
+cmd_rules_list() {
+  seed_rules_file_if_missing
+  run_root jq -r '.rules[] | "  [\(if .switch then "on " else "off" end)] \(.name)"' "$RULES_FILE"
+}
+
+cmd_rules_toggle() {
+  local name="${1:-}" state="${2:-}" val tmp
+  [[ -n "$name" && ( "$state" == "on" || "$state" == "off" ) ]] \
+    || die "Usage: $(basename "$0") rules toggle <name> on|off"
+
+  seed_rules_file_if_missing
+
+  run_root jq -e --arg name "$name" '.rules | any(.name == $name)' "$RULES_FILE" >/dev/null \
+    || die "Rule not found: $name (see: $(basename "$0") rules list)"
+
+  [[ "$state" == "on" ]] && val=true || val=false
+  tmp="$(mktemp)"
+  run_root jq --arg name "$name" --argjson val "$val" '
+    (.rules[] | select(.name == $name) | .switch) = $val
+  ' "$RULES_FILE" > "$tmp"
+  run_root install -m 0644 "$tmp" "$RULES_FILE"
+  rm -f "$tmp"
+  log "Rule '$name' -> $state. Apply with: $(basename "$0") rules apply"
+}
+
+cmd_rules_apply() {
+  ensure_cmd jq
+  run_root test -f "$CONFIG_FILE" || die "Configure the VPN first: $(basename "$0") configure or subscribe <url>"
+
+  local custom_rules_json tmp
+  custom_rules_json="$(compile_custom_rules)"
+  tmp="$(mktemp)"
+
+  run_root jq --argjson custom "$custom_rules_json" '
+    .route.rules = ([{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}] + $custom)
+  ' "$CONFIG_FILE" > "$tmp" || die "Could not apply rules to the current config"
+
+  run_root install -m 0600 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+
+  run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE" \
+    || die "New config failed sing-box validation, restore from a .backup-*.json"
+  run_root systemctl restart sing-box
+  log "Rules applied and sing-box restarted"
+}
+
 detect_public_ip() {
   local current_ip
   current_ip=""
@@ -1112,18 +1579,26 @@ detect_public_ip() {
 }
 
 show_status_summary() {
-  local current_ip mode include_uids users
+  local current_ip mode include_uids users dashboard_enabled clash_api_bind
 
   current_ip="$(detect_public_ip)"
   mode="unknown"
   users=""
+  dashboard_enabled="false"
+  clash_api_bind="$CLASH_API_BIND"
 
-  if run_root test -f "$STATE_FILE"; then
+  if run_root test -f "$SUBSCRIPTION_STATE_FILE"; then
+    mode="subscription"
+    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$SUBSCRIPTION_STATE_FILE")"
+    clash_api_bind="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$SUBSCRIPTION_STATE_FILE")"
+  elif run_root test -f "$STATE_FILE"; then
     mode="$(run_root jq -r '.user_scope // "unknown"' "$STATE_FILE")"
     include_uids="$(run_root jq -c '.include_uids // []' "$STATE_FILE")"
     if [[ "$include_uids" != "[]" ]]; then
       users="$(run_root jq -r '.include_uids | map(tostring) | join(", ")' "$STATE_FILE")"
     fi
+    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$STATE_FILE")"
+    clash_api_bind="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$STATE_FILE")"
   fi
 
   echo
@@ -1137,6 +1612,20 @@ show_status_summary() {
   if [[ -n "$users" ]]; then
     echo "  Routed UIDs: $users"
   fi
+
+  if [[ "$mode" == "subscription" ]] && run_root test -f "$SUBSCRIPTION_STATE_FILE"; then
+    echo "  Subscription URL: $(run_root jq -r '.url' "$SUBSCRIPTION_STATE_FILE")"
+    echo "  Servers: $(run_root jq -r '.proxy_count' "$SUBSCRIPTION_STATE_FILE")"
+    echo "  Last fetched: $(run_root jq -r '.fetched_at' "$SUBSCRIPTION_STATE_FILE")"
+  fi
+
+  if [[ "$mode" != "unknown" ]]; then
+    if [[ "$dashboard_enabled" == "true" ]]; then
+      echo "  Dashboard: http://${clash_api_bind}/ui/"
+    else
+      echo "  Dashboard: disabled (enable via: $(basename "$0") reconfigure)"
+    fi
+  fi
 }
 
 usage() {
@@ -1146,19 +1635,43 @@ usage() {
 Usage: ${cmd} <command>
 
 Commands:
-  configure     Interactive setup (URL: vless:// or ss://, or JSON for VLESS)
-  reconfigure   Same as configure
-  status        Show service status
-  start         Start VPN service
-  stop          Stop VPN service
-  restart       Restart VPN service
-  enable        Enable autostart on boot
-  disable       Disable autostart on boot
-  uninstall     Completely remove sing-box and all configurations
-  logs          Follow sing-box logs
-  show-config   Print /etc/sing-box/config.json
-  show-state    Print /etc/sing-box/vpnc-state.json
-  help          Show this help
+  configure          Interactive setup: single server (vless:// / ss:// / JSON) or a
+                     subscription (multiple servers). Also asks whether to enable the
+                     web dashboard.
+  reconfigure        Same as configure
+  subscribe [url]    Fetch/refresh a subscription non-interactively, reusing the
+                     dashboard on/off choice saved from configure. With no prior
+                     subscription on file, asks once whether to enable the dashboard.
+  rules edit         Edit the direct-vs-VPN rules file (\$EDITOR, default nano)
+  rules list         Show rule groups and their on/off state
+  rules toggle <name> on|off   Flip a rule group without opening the editor
+  rules apply        Recompile rules into sing-box and restart the service
+  status             Show service status
+  start              Start VPN service
+  stop               Stop VPN service
+  restart            Restart VPN service
+  enable             Enable autostart on boot
+  disable            Disable autostart on boot
+  uninstall          Completely remove sing-box and all configurations
+  logs               Follow sing-box logs
+  show-config        Print /etc/sing-box/config.json
+  show-state         Print /etc/sing-box/vpnc-state.json
+  help               Show this help
+
+Web dashboard:
+  The Clash-style dashboard (server list, ping/speed test, manual pick or
+  "auto"-fastest) is off by default and only turns on if you answer "yes" to
+  "Enable web dashboard?" during configure/subscribe — you're then also asked for the
+  bind address (IP:port), with VPNC_CLASH_API_BIND / CLASH_API_BIND's built-in default
+  (see the top of this script) offered as a suggestion. Once enabled it's served at
+  http://<bind>/ui/.
+
+Direct-vs-VPN rules:
+  \$RULES_FILE ($RULES_FILE) starts out empty — nothing bypasses the VPN until you add
+  rule groups yourself (${cmd} rules edit/toggle). To seed it from a JSON file instead,
+  set VPNC_RULES_SEED_PATH=<local path> or VPNC_RULES_SEED_URL=<url> (format:
+  {"rules": [...]}) before the first "rules" command runs; leave both unset to skip
+  seeding entirely.
 HELP_EOF
 }
 
@@ -1211,6 +1724,18 @@ main() {
   case "$cmd" in
     configure|reconfigure)
       configure_vpn
+      ;;
+    subscribe)
+      subscribe_vpn "${2:-}"
+      ;;
+    rules)
+      case "${2:-}" in
+        edit) cmd_rules_edit ;;
+        list) cmd_rules_list ;;
+        toggle) cmd_rules_toggle "${3:-}" "${4:-}" ;;
+        apply) cmd_rules_apply ;;
+        *) die "Usage: $(basename "$0") rules {edit|list|toggle|apply}" ;;
+      esac
       ;;
     status)
       ensure_runtime_dependencies
