@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# vpnc manager entry point. Loads lib/common.sh + lib/<os>.sh, then dispatches.
+set -Eeuo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  target="$(readlink "$SELF")"
+  case "$target" in
+    /*) SELF="$target" ;;
+    *) SELF="$(dirname "$SELF")/$target" ;;
+  esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+# Running from a checkout (bin/ next to lib/) or from the installed location.
+if [[ -f "$SELF_DIR/../lib/common.sh" ]]; then
+  VPNC_LIB_DIR="$SELF_DIR/../lib"
+else
+  VPNC_LIB_DIR="${VPNC_LIB_DIR:-/usr/local/lib/vpnc}"
+fi
+
+# shellcheck source=../lib/common.sh
+source "$VPNC_LIB_DIR/common.sh"
+VPNC_OS="$(detect_os)"
+# shellcheck source=../lib/linux.sh
+source "$VPNC_LIB_DIR/${VPNC_OS}.sh"
+
+# Re-evaluate now that OS_DEFAULT_CLASH_BIND is known.
+CLASH_API_BIND="${VPNC_CLASH_API_BIND:-$OS_DEFAULT_CLASH_BIND}"
+
+main() {
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    configure|reconfigure)
+      configure_vpn
+      ;;
+    subscribe)
+      subscribe_vpn "${2:-}"
+      ;;
+    rules)
+      case "${2:-}" in
+        edit) cmd_rules_edit ;;
+        import) cmd_rules_import "${3:-}" ;;
+        list) cmd_rules_list ;;
+        toggle) cmd_rules_toggle "${3:-}" "${4:-}" ;;
+        apply) cmd_rules_apply ;;
+        *) die "Usage: $(basename "$0") rules {edit|import|list|toggle|apply}" ;;
+      esac
+      ;;
+    status)
+      ensure_runtime_dependencies
+      os_service_status
+      show_status_summary
+      ;;
+    start)
+      ensure_runtime_dependencies
+      os_service_start
+      ;;
+    stop)
+      ensure_runtime_dependencies
+      os_service_stop
+      ;;
+    restart)
+      ensure_runtime_dependencies
+      os_service_restart
+      ;;
+    enable)
+      ensure_runtime_dependencies
+      os_service_enable
+      ;;
+    disable)
+      ensure_runtime_dependencies
+      os_service_disable
+      ;;
+    uninstall)
+      uninstall_vpn
+      ;;
+    logs)
+      ensure_runtime_dependencies
+      os_service_logs
+      ;;
+    show-config)
+      ensure_runtime_dependencies
+      run_root cat "$CONFIG_FILE"
+      ;;
+    show-state)
+      ensure_runtime_dependencies
+      run_root cat "$STATE_FILE"
+      ;;
+    _apply-selected-routing)
+      apply_selected_routing_from_state
+      ;;
+    _clear-selected-routing)
+      ensure_runtime_dependencies
+      clear_selected_routing
+      clear_legacy_sing_box_routing
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
