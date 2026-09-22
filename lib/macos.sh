@@ -15,6 +15,10 @@ LAUNCHD_LABEL="com.makrelbka.vpnc.sing-box"
 SERVICE_FILE="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
 SERVICE_LOG="/var/log/sing-box.log"
 
+SUBSCRIPTION_LAUNCHD_LABEL="com.makrelbka.vpnc.subscription-refresh"
+SUBSCRIPTION_SERVICE_FILE="/Library/LaunchDaemons/${SUBSCRIPTION_LAUNCHD_LABEL}.plist"
+SUBSCRIPTION_LOG="/var/log/vpnc-subscription.log"
+
 os_service_file() {
   echo "$SERVICE_FILE"
 }
@@ -108,7 +112,8 @@ os_service_write() {
 }
 
 _launchd_loaded() {
-  run_root launchctl print "system/${LAUNCHD_LABEL}" >/dev/null 2>&1
+  local label="${1:-$LAUNCHD_LABEL}"
+  run_root launchctl print "system/${label}" >/dev/null 2>&1
 }
 
 # launchd re-reads the plist on bootstrap, so there is nothing to reload here.
@@ -163,6 +168,68 @@ os_service_logs() {
 os_service_remove() {
   run_root launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
   run_root rm -f "$SERVICE_FILE" "$SERVICE_LOG"
+}
+
+# --- subscription auto-refresh (launchd StartInterval) ----------------------
+
+os_subscription_timer_write() {
+  local interval_sec="$1"
+  local tmp_plist
+  tmp_plist="$(mktemp)"
+
+  cat > "$tmp_plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${SUBSCRIPTION_LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/vpnc</string>
+    <string>subscribe</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>${interval_sec}</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${SUBSCRIPTION_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${SUBSCRIPTION_LOG}</string>
+</dict>
+</plist>
+PLIST_EOF
+
+  run_root install -d -m 0755 "$(dirname "$SUBSCRIPTION_SERVICE_FILE")"
+  run_root install -m 0644 "$tmp_plist" "$SUBSCRIPTION_SERVICE_FILE"
+  run_root chown root:wheel "$SUBSCRIPTION_SERVICE_FILE"
+  rm -f "$tmp_plist"
+}
+
+os_subscription_timer_enable() {
+  if _launchd_loaded "$SUBSCRIPTION_LAUNCHD_LABEL"; then
+    run_root launchctl bootout "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
+  fi
+  run_root launchctl enable "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
+  run_root launchctl bootstrap system "$SUBSCRIPTION_SERVICE_FILE"
+}
+
+os_subscription_timer_disable() {
+  run_root launchctl bootout "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
+}
+
+os_subscription_timer_remove() {
+  os_subscription_timer_disable
+  run_root rm -f "$SUBSCRIPTION_SERVICE_FILE" "$SUBSCRIPTION_LOG"
+}
+
+os_subscription_timer_status() {
+  if _launchd_loaded "$SUBSCRIPTION_LAUNCHD_LABEL"; then
+    echo "on, every ${SUBSCRIPTION_REFRESH_SEC}s"
+  else
+    echo "off"
+  fi
 }
 
 # Per-user routing is Linux-only: keep the shared code paths as no-ops.

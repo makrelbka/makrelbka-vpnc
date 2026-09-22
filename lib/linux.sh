@@ -8,6 +8,10 @@ OS_AUTO_REDIRECT="true"          # sing-box auto_redirect is Linux-only (needs n
 OS_TUN_INTERFACE="sbtun"
 
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
+SUBSCRIPTION_TIMER_UNIT="vpnc-subscription.timer"
+SUBSCRIPTION_SERVICE_UNIT="vpnc-subscription.service"
+SUBSCRIPTION_TIMER_FILE="/etc/systemd/system/${SUBSCRIPTION_TIMER_UNIT}"
+SUBSCRIPTION_SERVICE_FILE="/etc/systemd/system/${SUBSCRIPTION_SERVICE_UNIT}"
 
 os_service_file() {
   echo "$SERVICE_FILE"
@@ -169,6 +173,69 @@ os_service_logs() {
 os_service_remove() {
   run_root rm -f "$SERVICE_FILE"
   run_root rm -rf /etc/systemd/system/sing-box.service.d
+}
+
+# --- subscription auto-refresh (systemd timer) ------------------------------
+
+os_subscription_timer_write() {
+  local interval_sec="$1"
+  local tmp_service tmp_timer
+
+  tmp_service="$(mktemp)"
+  cat > "$tmp_service" <<UNIT_EOF
+[Unit]
+Description=vpnc subscription refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpnc subscribe
+UNIT_EOF
+  run_root install -m 0644 "$tmp_service" "$SUBSCRIPTION_SERVICE_FILE"
+  rm -f "$tmp_service"
+
+  tmp_timer="$(mktemp)"
+  cat > "$tmp_timer" <<UNIT_EOF
+[Unit]
+Description=Periodic vpnc subscription refresh
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval_sec}s
+Persistent=true
+Unit=${SUBSCRIPTION_SERVICE_UNIT}
+
+[Install]
+WantedBy=timers.target
+UNIT_EOF
+  run_root install -m 0644 "$tmp_timer" "$SUBSCRIPTION_TIMER_FILE"
+  rm -f "$tmp_timer"
+
+  run_root systemctl daemon-reload
+}
+
+os_subscription_timer_enable() {
+  run_root systemctl enable --now "$SUBSCRIPTION_TIMER_UNIT"
+}
+
+os_subscription_timer_disable() {
+  run_root systemctl disable --now "$SUBSCRIPTION_TIMER_UNIT" 2>/dev/null || true
+}
+
+os_subscription_timer_remove() {
+  run_root rm -f "$SUBSCRIPTION_TIMER_FILE" "$SUBSCRIPTION_SERVICE_FILE"
+  run_root systemctl daemon-reload
+}
+
+os_subscription_timer_status() {
+  if run_root systemctl is-active --quiet "$SUBSCRIPTION_TIMER_UNIT" 2>/dev/null; then
+    local next
+    next="$(run_root systemctl show "$SUBSCRIPTION_TIMER_UNIT" -p NextElapseUSecRealtime --value 2>/dev/null)"
+    echo "on, every ${SUBSCRIPTION_REFRESH_SEC}s (next: ${next:-unknown})"
+  else
+    echo "off"
+  fi
 }
 
 delete_ip_rule_pref() {
