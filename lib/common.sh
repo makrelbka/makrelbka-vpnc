@@ -29,6 +29,10 @@ CLASH_API_BIND="${VPNC_CLASH_API_BIND:-${OS_DEFAULT_CLASH_BIND:-127.0.0.1:9090}}
 # with `rules edit`/`rules toggle`.
 RULES_SEED_PATH="${VPNC_RULES_SEED_PATH:-}"
 RULES_SEED_URL="${VPNC_RULES_SEED_URL:-}"
+# How often a saved subscription is re-fetched in the background (systemd timer on
+# Linux, launchd StartInterval on macOS), in seconds. Set up by configure_subscription
+# once a subscription is active; torn down when switching back to single-server mode.
+SUBSCRIPTION_REFRESH_SEC="${VPNC_SUBSCRIPTION_REFRESH_SEC:-300}"
 
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
@@ -638,6 +642,64 @@ select_clash_api_bind() {
   fi
 }
 
+# A well-known path the invoking (non-root) user can drop a rules JSON into without
+# needing sudo, so "I already put a file there" in select_rules_source has somewhere
+# fixed to point at. Resolves the real user's home even when running under sudo.
+default_rules_candidate_path() {
+  local home
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    home="$(eval echo "~${SUDO_USER}" 2>/dev/null)"
+  fi
+  [[ -n "$home" ]] || home="${HOME:-/root}"
+  echo "${home}/vpnc-rules.json"
+}
+
+# Interactive rules-source prompt, run once during configure/reconfigure (never during
+# the unattended `subscribe` background refresh). Delegates to cmd_rules_import, which
+# validates the JSON and keeps a timestamped backup of whatever was there before.
+select_rules_source() {
+  local default_path choice current_count
+  default_path="$(default_rules_candidate_path)"
+
+  echo >&2
+  echo "Direct-vs-VPN rules (which domains/apps/ports bypass the VPN):" >&2
+  if run_root test -f "$RULES_FILE"; then
+    current_count="$(run_root jq '.rules | length' "$RULES_FILE" 2>/dev/null || echo '?')"
+    echo "  Current: $current_count rule group(s) already set (${RULES_FILE})." >&2
+  fi
+  echo "  1) Skip for now (keep as-is)" >&2
+  echo "  2) I put a file at ${default_path} — use it" >&2
+  echo "  3) Download from a URL" >&2
+  echo "  4) Use a local file path" >&2
+  read -r -p "Enter number [1-4] (default: 1): " choice
+  choice="${choice:-1}"
+
+  case "$choice" in
+    1)
+      return
+      ;;
+    2)
+      [[ -f "$default_path" ]] || die "No file found at $default_path"
+      cmd_rules_import "$default_path"
+      ;;
+    3)
+      local url
+      read -r -p "Rules URL: " url
+      [[ -n "$url" ]] || die "URL is required"
+      cmd_rules_import "$url"
+      ;;
+    4)
+      local path
+      read -r -p "Rules file path: " path
+      [[ -n "$path" ]] || die "Path is required"
+      cmd_rules_import "$path"
+      ;;
+    *)
+      warn "Invalid choice, skipping rules import"
+      ;;
+  esac
+}
+
 write_state_file() {
   local user_scope="$1"
   local include_uids_json="${2:-[]}"
@@ -669,7 +731,7 @@ write_config() {
   local outbound="$1"
   local user_scope="$2"
   local dashboard_enabled="${3:-false}"
-  local auto_route_json auto_redirect_json tmp_config backup_file outbound_tag
+  local auto_route_json auto_redirect_json tmp_config backup_file outbound_tag custom_dns_rules_json
 
   auto_route_json=false
   auto_redirect_json=false
@@ -680,6 +742,7 @@ write_config() {
 
   tmp_config="$(mktemp)"
   outbound_tag="$(jq -r '.tag' <<<"$outbound")"
+  custom_dns_rules_json="$(compile_custom_dns_rules)"
 
   jq -n \
     --argjson outbound "$outbound" \
@@ -687,6 +750,7 @@ write_config() {
     --argjson auto_route "$auto_route_json" \
     --argjson auto_redirect "$auto_redirect_json" \
     --arg tun_name "${OS_TUN_INTERFACE:-}" \
+    --argjson custom_dns_rules "$custom_dns_rules_json" \
     --argjson dashboard_enabled "$dashboard_enabled" \
     --arg clash_bind "$CLASH_API_BIND" \
     --arg clash_ui_dir "$CLASH_UI_DIR" '
@@ -703,8 +767,13 @@ write_config() {
             type: "tls",
             tag: "google",
             server: "8.8.8.8"
+          },
+          {
+            type: "local",
+            tag: "local"
           }
         ],
+        rules: $custom_dns_rules,
         final: "cloudflare"
       },
       inbounds: [
@@ -778,6 +847,10 @@ configure_vpn() {
 
   local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme dashboard_enabled sub_url
 
+  # Asked once here (never during the unattended `subscribe` background refresh) so it
+  # covers both the single-server and subscription paths below.
+  select_rules_source
+
   input_type="$(select_input_type)"
 
   if [[ "$input_type" == "subscription" ]]; then
@@ -815,6 +888,12 @@ configure_vpn() {
   write_config "$outbound" "$user_scope" "$dashboard_enabled"
   write_state_file "$user_scope" "$include_uids_json" "$dashboard_enabled" "$CLASH_API_BIND"
   os_service_write
+
+  # Single-server mode has no subscription to refresh — drop any leftover
+  # subscription state and background refresh timer from a previous `subscribe`.
+  run_root rm -f "$SUBSCRIPTION_STATE_FILE"
+  os_subscription_timer_disable
+  os_subscription_timer_remove
 
   if [[ "$user_scope" == "selected" ]]; then
     clear_selected_routing
@@ -995,17 +1074,49 @@ compile_custom_rules() {
   ' "$RULES_FILE"
 }
 
+# Derives dns.rules from the same rules file as compile_custom_rules: any *domain-only*
+# group routed "direct" also gets its DNS queries answered by the "local" (OS/system
+# resolver) DNS server instead of the hijacked cloudflare/google one. Needed for
+# corp/internal hostnames (e.g. behind Cisco AnyConnect's split-DNS) that plain public
+# DNS can't resolve — matching them for direct routing alone isn't enough if the queried
+# name never resolves in the first place. ip_cidr/port/process_name/network conditions
+# don't carry meaning for DNS lookups, so groups using only those are left out (DNS
+# still resolves via cloudflare/google for them, which is what you want for pure IP or
+# process-based rules).
+compile_custom_dns_rules() {
+  local compiled
+  compiled="$(compile_custom_rules)"
+
+  jq -c '
+    def domain_keys: ["domain","domain_suffix","domain_keyword","domain_regex"];
+    [
+      .[]
+      | select(.outbound == "direct")
+      | select(
+          if .type == "logical" then
+            (.rules | all(keys[0] as $k | (domain_keys | index($k)) != null))
+          else
+            (((keys - ["outbound"])[0]) as $k | (domain_keys | index($k)) != null)
+          end
+        )
+      | (del(.outbound) + {server: "local"})
+    ]
+  ' <<<"$compiled"
+}
+
 write_subscription_config() {
   local dashboard_enabled="${1:-false}"
-  local tmp_config backup_file custom_rules_json
+  local tmp_config backup_file custom_rules_json custom_dns_rules_json
 
   custom_rules_json="$(compile_custom_rules)"
+  custom_dns_rules_json="$(compile_custom_dns_rules)"
   tmp_config="$(mktemp)"
 
   jq -n \
     --argjson proxies "$SUBSCRIPTION_PROXIES_JSON" \
     --argjson tags "$SUBSCRIPTION_TAGS_JSON" \
     --argjson custom_rules "$custom_rules_json" \
+    --argjson custom_dns_rules "$custom_dns_rules_json" \
     --argjson auto_redirect "${OS_AUTO_REDIRECT:-false}" \
     --arg tun_name "${OS_TUN_INTERFACE:-}" \
     --argjson dashboard_enabled "$dashboard_enabled" \
@@ -1017,8 +1128,10 @@ write_subscription_config() {
       dns: {
         servers: [
           { type: "tls", tag: "cloudflare", server: "1.1.1.1" },
-          { type: "tls", tag: "google", server: "8.8.8.8" }
+          { type: "tls", tag: "google", server: "8.8.8.8" },
+          { type: "local", tag: "local" }
         ],
+        rules: $custom_dns_rules,
         final: "cloudflare"
       },
       inbounds: [
@@ -1073,6 +1186,18 @@ write_subscription_config() {
 
   if [[ "$dashboard_enabled" == "true" ]]; then
     run_root install -d -m 0755 "$CLASH_UI_DIR"
+  fi
+
+  # Periodic refresh (see os_subscription_timer_*) re-downloads the subscription and
+  # calls back in here every $SUBSCRIPTION_REFRESH_SEC — if the server list is the same
+  # bytes as last time, skip the backup+install+restart so sing-box doesn't drop active
+  # connections on ticks where nothing actually changed. Sets SUBSCRIPTION_CONFIG_CHANGED
+  # for the caller.
+  SUBSCRIPTION_CONFIG_CHANGED="true"
+  if run_root test -f "$CONFIG_FILE" && run_root cmp -s "$tmp_config" "$CONFIG_FILE"; then
+    SUBSCRIPTION_CONFIG_CHANGED="false"
+    rm -f "$tmp_config"
+    return
   fi
 
   if run_root test -f "$CONFIG_FILE"; then
@@ -1130,11 +1255,22 @@ configure_subscription() {
   os_service_reload
   os_service_enable >/dev/null
   run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE"
-  os_service_restart
-  sleep 2
+
+  # Only restart (and drop active connections) when the config actually changed, or
+  # when sing-box isn't already running — matters for the periodic refresh timer,
+  # which calls this every $SUBSCRIPTION_REFRESH_SEC even if the server list is stable.
+  if [[ "$SUBSCRIPTION_CONFIG_CHANGED" == "true" ]] || ! os_service_is_active; then
+    os_service_restart
+    sleep 2
+  else
+    log "Subscription unchanged ($server_count servers) — kept the running connection"
+  fi
+
+  os_subscription_timer_write "$SUBSCRIPTION_REFRESH_SEC"
+  os_subscription_timer_enable
 
   if os_service_is_active; then
-    log "Subscription applied ($server_count servers)."
+    log "Subscription applied ($server_count servers). Background refresh every ${SUBSCRIPTION_REFRESH_SEC}s."
     if [[ "$dashboard_enabled" == "true" ]]; then
       echo "[INFO] Dashboard: http://${CLASH_API_BIND}/ui/ (reachable only from ${CLASH_API_BIND%%:*})"
     else
@@ -1250,12 +1386,15 @@ cmd_rules_apply() {
   ensure_cmd jq
   run_root test -f "$CONFIG_FILE" || die "Configure the VPN first: $(basename "$0") configure or subscribe <url>"
 
-  local custom_rules_json tmp
+  local custom_rules_json custom_dns_rules_json tmp
   custom_rules_json="$(compile_custom_rules)"
+  custom_dns_rules_json="$(compile_custom_dns_rules)"
   tmp="$(mktemp)"
 
-  run_root jq --argjson custom "$custom_rules_json" '
+  run_root jq --argjson custom "$custom_rules_json" --argjson custom_dns "$custom_dns_rules_json" '
     .route.rules = ([{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}] + $custom)
+    | .dns.rules = $custom_dns
+    | if (.dns.servers | any(.tag == "local")) then . else .dns.servers += [{type: "local", tag: "local"}] end
   ' "$CONFIG_FILE" > "$tmp" || die "Could not apply rules to the current config"
 
   run_root install -m 0600 "$tmp" "$CONFIG_FILE"
@@ -1321,6 +1460,7 @@ show_status_summary() {
     echo "  Subscription URL: $(run_root jq -r '.url' "$SUBSCRIPTION_STATE_FILE")"
     echo "  Servers: $(run_root jq -r '.proxy_count' "$SUBSCRIPTION_STATE_FILE")"
     echo "  Last fetched: $(run_root jq -r '.fetched_at' "$SUBSCRIPTION_STATE_FILE")"
+    echo "  Auto-refresh: $(os_subscription_timer_status)"
   fi
 
   if [[ "$mode" != "unknown" ]]; then
@@ -1340,12 +1480,14 @@ Usage: ${cmd} <command>
 
 Commands:
   configure          Interactive setup: single server (vless:// / ss:// / JSON) or a
-                     subscription (multiple servers). Also asks whether to enable the
-                     web dashboard.
+                     subscription (multiple servers). Also asks about the direct-vs-VPN
+                     rules file (skip / a well-known local path / a URL / a file path)
+                     and whether to enable the web dashboard.
   reconfigure        Same as configure
   subscribe [url]    Fetch/refresh a subscription non-interactively, reusing the
                      dashboard on/off choice saved from configure. With no prior
                      subscription on file, asks once whether to enable the dashboard.
+                     Also (re)installs the background auto-refresh timer (see below).
   rules edit         Edit the direct-vs-VPN rules file (\$EDITOR, default nano)
   rules import <path|url>   Replace the rules file from a {"rules": [...]} JSON
   rules list         Show rule groups and their on/off state
@@ -1377,6 +1519,16 @@ Direct-vs-VPN rules:
   set VPNC_RULES_SEED_PATH=<local path> or VPNC_RULES_SEED_URL=<url> (format:
   {"rules": [...]}) before the first "rules" command runs; leave both unset to skip
   seeding entirely.
+
+Subscription auto-refresh:
+  Once a subscription is active (configure's option 3, or "subscribe"), it is
+  re-downloaded every ${SUBSCRIPTION_REFRESH_SEC}s in the background (systemd timer on
+  Linux, launchd on macOS) so server changes on the provider's side show up without you
+  running "subscribe" by hand. sing-box is only restarted (dropping active connections)
+  when the refreshed server list actually differs from what's running — an unchanged
+  refresh is a no-op. Override the interval with VPNC_SUBSCRIPTION_REFRESH_SEC (seconds)
+  before running configure/subscribe. Switching back to single-server mode removes the
+  timer automatically.
 HELP_EOF
 }
 
@@ -1387,6 +1539,7 @@ uninstall_vpn() {
   echo "  - /usr/local/bin/sing-box"
   echo "  - /etc/sing-box/"
   echo "  - $(os_service_file)"
+  echo "  - subscription refresh timer (if a subscription is active)"
   echo "  - /usr/local/bin/vpnc"
   echo "  - /usr/local/bin/makrelbka-vpnc"
   echo "  - /usr/local/lib/vpnc/"
@@ -1401,6 +1554,10 @@ uninstall_vpn() {
   echo "Stopping and disabling sing-box service..."
   os_service_stop 2>/dev/null || true
   os_service_disable 2>/dev/null || true
+
+  echo "Stopping subscription refresh timer..."
+  os_subscription_timer_disable 2>/dev/null || true
+  os_subscription_timer_remove 2>/dev/null || true
 
   echo "Clearing routing runtime rules..."
   clear_selected_routing
