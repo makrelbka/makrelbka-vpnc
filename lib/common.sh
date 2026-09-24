@@ -650,7 +650,7 @@ default_rules_candidate_path() {
   if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
     home="$(eval echo "~${SUDO_USER}" 2>/dev/null)"
   fi
-  [[ -n "$home" ]] || home="${HOME:-/root}"
+  [[ -n "${home:-}" ]] || home="${HOME:-/root}"
   echo "${home}/vpnc-rules.json"
 }
 

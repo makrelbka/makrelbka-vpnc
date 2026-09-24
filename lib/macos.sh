@@ -116,6 +116,36 @@ _launchd_loaded() {
   run_root launchctl print "system/${label}" >/dev/null 2>&1
 }
 
+# `launchctl bootout` returns before the daemon has fully stopped (sing-box tears its TUN
+# down first), and a `bootstrap` issued in that window fails with "Input/output error"
+# (5), leaving the service unloaded. So: wait for the unload, then retry the bootstrap.
+_launchd_wait_unloaded() {
+  local label="${1:-$LAUNCHD_LABEL}" i
+  for i in $(seq 1 30); do
+    _launchd_loaded "$label" || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+_launchd_bootstrap() {
+  local plist="$1" label="$2" i
+  for i in 1 2 3 4 5; do
+    if run_root launchctl bootstrap system "$plist" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  if launchctl print-disabled system 2>/dev/null | grep -q "\"${label}\" => disabled"; then
+    die "Service ${label} is disabled in launchd (autostart off). Run: $(basename "$0") enable"
+  fi
+
+  # Last attempt, this time letting launchctl show the real error.
+  run_root launchctl bootstrap system "$plist" \
+    || die "Could not load ${label}. Inspect: sudo launchctl print system/${label}"
+}
+
 # launchd re-reads the plist on bootstrap, so there is nothing to reload here.
 os_service_reload() {
   return 0
@@ -133,8 +163,7 @@ os_service_start() {
   if _launchd_loaded; then
     run_root launchctl kickstart "system/${LAUNCHD_LABEL}"
   else
-    run_root launchctl bootstrap system "$SERVICE_FILE" \
-      || die "Could not load the service. If autostart was disabled, run: $(basename "$0") enable"
+    _launchd_bootstrap "$SERVICE_FILE" "$LAUNCHD_LABEL"
   fi
 }
 
@@ -145,8 +174,8 @@ os_service_stop() {
 
 os_service_restart() {
   run_root launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
-  run_root launchctl bootstrap system "$SERVICE_FILE" \
-    || die "Could not load the service. If autostart was disabled, run: $(basename "$0") enable"
+  _launchd_wait_unloaded "$LAUNCHD_LABEL" || warn "Service is slow to stop, trying to start it anyway"
+  _launchd_bootstrap "$SERVICE_FILE" "$LAUNCHD_LABEL"
 }
 
 os_service_is_active() {
@@ -210,9 +239,10 @@ PLIST_EOF
 os_subscription_timer_enable() {
   if _launchd_loaded "$SUBSCRIPTION_LAUNCHD_LABEL"; then
     run_root launchctl bootout "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
+    _launchd_wait_unloaded "$SUBSCRIPTION_LAUNCHD_LABEL" || true
   fi
   run_root launchctl enable "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
-  run_root launchctl bootstrap system "$SUBSCRIPTION_SERVICE_FILE"
+  _launchd_bootstrap "$SUBSCRIPTION_SERVICE_FILE" "$SUBSCRIPTION_LAUNCHD_LABEL"
 }
 
 os_subscription_timer_disable() {
