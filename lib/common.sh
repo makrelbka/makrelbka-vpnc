@@ -1,15 +1,15 @@
 # shellcheck shell=bash
-# Shared logic for vpnc: sing-box config generation, URI/subscription parsing,
+# Shared logic for vpnc: mihomo config generation, URI/subscription parsing,
 # rules, prompts. OS-specific pieces (service, deps, routing) live in lib/<os>.sh
 # and are called through the os_* / *_selected_routing functions defined there.
 # Compatible with bash 3.2 (macOS system bash) — no associative arrays.
 
 export PATH="/usr/local/sbin:/usr/local/bin:/opt/homebrew/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
-CONFIG_DIR="/etc/sing-box"
-CONFIG_FILE="/etc/sing-box/config.json"
-STATE_FILE="/etc/sing-box/vpnc-state.json"
-NFT_DIR="/etc/sing-box/nftables.d"
+CONFIG_DIR="/etc/mihomo"
+CONFIG_FILE="/etc/mihomo/config.yaml"
+STATE_FILE="/etc/mihomo/vpnc-state.json"
+NFT_DIR="/etc/mihomo/nftables.d"
 NFT_FILE="${NFT_DIR}/vpnc-selected-users.nft"
 SELECTED_MARK_HEX="0x2023"
 SELECTED_MARK_NFT="0x00002023"
@@ -17,7 +17,6 @@ SELECTED_ROUTE_TABLE="10023"
 SELECTED_RULE_PREF="8990"
 
 RULES_FILE="${CONFIG_DIR}/vpnc-rules.json"
-SUBSCRIPTION_STATE_FILE="${CONFIG_DIR}/vpnc-subscription.json"
 CLASH_UI_DIR="${CONFIG_DIR}/ui"
 # Default IP:port suggested for the dashboard/API prompt. Comes from the OS layer
 # (OS_DEFAULT_CLASH_BIND: the Wi-Fi hotspot address on Linux, loopback on macOS).
@@ -29,24 +28,16 @@ CLASH_API_BIND="${VPNC_CLASH_API_BIND:-${OS_DEFAULT_CLASH_BIND:-127.0.0.1:9090}}
 # with `rules edit`/`rules toggle`.
 RULES_SEED_PATH="${VPNC_RULES_SEED_PATH:-}"
 RULES_SEED_URL="${VPNC_RULES_SEED_URL:-}"
-# How often a saved subscription is re-fetched in the background (systemd timer on
-# Linux, launchd StartInterval on macOS), in seconds. Set up by configure_subscription
-# once a subscription is active; torn down when switching back to single-server mode.
+# How often mihomo re-downloads the saved subscription itself (proxy-providers `interval`).
 SUBSCRIPTION_REFRESH_SEC="${VPNC_SUBSCRIPTION_REFRESH_SEC:-300}"
-
-# Failover watcher (`vpnc _tick`, run by the same background job as the subscription
-# refresh). The tick fires every WATCH_INTERVAL_SEC; the subscription itself is only
-# re-fetched every SUBSCRIPTION_REFRESH_SEC. clash_api without the web UI listens on
-# VPNC_CONTROL_BIND (loopback) with a random secret kept in the subscription state file.
-WATCH_INTERVAL_SEC="${VPNC_WATCH_SEC:-20}"
-WATCH_FAIL_TICKS="${VPNC_WATCH_FAIL_TICKS:-2}"
-WATCH_OK_TICKS="${VPNC_WATCH_OK_TICKS:-2}"
+# mihomo's external controller without the web UI listens on VPNC_CONTROL_BIND (loopback)
+# with a random secret kept in the state file; vpnc uses it to reload and refresh.
 CONTROL_BIND_DEFAULT="${VPNC_CONTROL_BIND:-127.0.0.1:9099}"
-WATCH_FILE="${CONFIG_DIR}/vpnc-watch.json"
+MIHOMO_BIN="/usr/local/bin/mihomo"
+PROVIDERS_DIR="${CONFIG_DIR}/providers"
 PROBE_URL="https://www.gstatic.com/generate_204"
-# Copy of the config sing-box was last (re)started with. A subscription refresh compares the
-# new config against it to decide whether a restart (which drops every connection) is needed.
-RUNNING_FILE="${CONFIG_DIR}/config.running.json"
+# Torrent-only / whitelist-CDN nodes of the provider, never wanted in the pool (same as clash/gen.py).
+SUB_EXCLUDE="Торрент|Белые списки"
 
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
@@ -739,167 +730,294 @@ select_rules_source() {
   esac
 }
 
-write_state_file() {
-  local user_scope="$1"
-  local include_uids_json="${2:-[]}"
-  local dashboard_enabled="${3:-false}"
-  local clash_api_bind="${4:-$CLASH_API_BIND}"
-  local tmp_state
+# ---------------------------------------------------------------------------
+# State (/etc/mihomo/vpnc-state.json, 0600): everything the config is rebuilt from, so
+# `rules apply`, `primary` and `subscribe <url>` can regenerate it without asking again.
+# Fields: mode (single|subscription), user_scope, include_uids, dashboard_enabled,
+# clash_api_bind, api_secret, url, primary, proxy (single mode: mihomo proxy object).
+# ---------------------------------------------------------------------------
 
-  tmp_state="$(mktemp)"
-
-  jq -n \
-    --arg user_scope "$user_scope" \
-    --argjson include_uids "$include_uids_json" \
-    --argjson dashboard_enabled "$dashboard_enabled" \
-    --arg clash_api_bind "$clash_api_bind" '
-    {
-      user_scope: $user_scope,
-      include_uids: $include_uids,
-      dashboard_enabled: $dashboard_enabled,
-      clash_api_bind: $clash_api_bind
-    }
-  ' > "$tmp_state"
-
-  run_root install -d -m 0755 "$CONFIG_DIR"
-  run_root install -m 0600 "$tmp_state" "$STATE_FILE"
-  rm -f "$tmp_state"
+# Loads the state file into ST_* globals (defaults when there is no file yet).
+load_state() {
+  ST_MODE=""; ST_SCOPE="all"; ST_UIDS='[]'; ST_DASH="false"; ST_BIND="$CLASH_API_BIND"
+  ST_SECRET=""; ST_URL=""; ST_PRIMARY=""; ST_PROXY="null"
+  run_root test -f "$STATE_FILE" || return 0
+  local s
+  s="$(run_root cat "$STATE_FILE")"
+  ST_MODE="$(jq -r '.mode // ""' <<<"$s")"
+  ST_SCOPE="$(jq -r '.user_scope // "all"' <<<"$s")"
+  ST_UIDS="$(jq -c '.include_uids // []' <<<"$s")"
+  ST_DASH="$(jq -r '.dashboard_enabled // false' <<<"$s")"
+  ST_BIND="$(jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' <<<"$s")"
+  ST_SECRET="$(jq -r '.api_secret // ""' <<<"$s")"
+  ST_URL="$(jq -r '.url // ""' <<<"$s")"
+  ST_PRIMARY="$(jq -r '.primary // ""' <<<"$s")"
+  ST_PROXY="$(jq -c '.proxy // null' <<<"$s")"
+  # Mode was not stored by older installs: a saved subscription URL means subscription.
+  if [[ -z "$ST_MODE" ]]; then
+    if [[ -n "$ST_URL" ]]; then ST_MODE="subscription"; else ST_MODE="single"; fi
+  fi
 }
 
-write_config() {
-  local outbound="$1"
-  local user_scope="$2"
-  local dashboard_enabled="${3:-false}"
-  local auto_route_json auto_redirect_json tmp_config backup_file outbound_tag custom_dns_rules_json
+save_state() {
+  local tmp
+  [[ -n "$ST_SECRET" ]] || ST_SECRET="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  tmp="$(mktemp)"
+  jq -n \
+    --arg mode "$ST_MODE" --arg user_scope "$ST_SCOPE" --argjson include_uids "$ST_UIDS" \
+    --argjson dashboard_enabled "$ST_DASH" --arg clash_api_bind "$ST_BIND" \
+    --arg api_secret "$ST_SECRET" --arg url "$ST_URL" --arg primary "$ST_PRIMARY" \
+    --argjson proxy "$ST_PROXY" '
+    {mode: $mode, user_scope: $user_scope, include_uids: $include_uids,
+     dashboard_enabled: $dashboard_enabled, clash_api_bind: $clash_api_bind,
+     api_secret: $api_secret, url: $url, primary: $primary, proxy: $proxy}
+  ' > "$tmp"
+  run_root install -d -m 0755 "$CONFIG_DIR"
+  run_root install -m 0600 "$tmp" "$STATE_FILE"
+  rm -f "$tmp"
+}
 
-  auto_route_json=false
-  auto_redirect_json=false
-  if [[ "$user_scope" == "all" ]]; then
-    auto_route_json=true
-    auto_redirect_json="${OS_AUTO_REDIRECT:-false}"
+# Address and secret of mihomo's external controller: the dashboard address without a
+# secret when the dashboard is on (it is local, as before), else loopback + random secret.
+control_endpoint() {
+  if [[ "$ST_DASH" == "true" ]]; then
+    CTL_BIND="$ST_BIND"; CTL_SECRET=""
+  else
+    CTL_BIND="$CONTROL_BIND_DEFAULT"; CTL_SECRET="$ST_SECRET"
   fi
+}
 
-  tmp_config="$(mktemp)"
-  outbound_tag="$(jq -r '.tag' <<<"$outbound")"
-  custom_dns_rules_json="$(compile_custom_dns_rules)"
+# api_call METHOD PATH [JSON_BODY] — talks to the running mihomo.
+api_call() {
+  local method="$1" path="$2" body="${3:-}"
+  load_state
+  control_endpoint
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer ${CTL_SECRET}" \
+      -H 'Content-Type: application/json' -d "$body" "http://${CTL_BIND}${path}"
+  else
+    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer ${CTL_SECRET}" "http://${CTL_BIND}${path}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Config generation. mihomo reads JSON as YAML, so the whole config is one jq program.
+# ---------------------------------------------------------------------------
+
+# sb_outbound_to_mihomo — stdin: sing-box outbound (what build_outbound_from_* produce),
+# stdout: the same server as a mihomo proxy named SERVER. Only what those parsers emit.
+sb_outbound_to_mihomo() {
+  jq -c '
+    if .type == "vless" then
+      ({name: "SERVER", type: "vless", server: .server, port: .server_port, uuid: .uuid,
+        udp: true, network: (.transport.type // "tcp")}
+       + (if (.flow // "") != "" then {flow: .flow} else {} end)
+       + (if .tls.enabled then
+            ({tls: true, servername: (.tls.server_name // .server),
+              "client-fingerprint": (.tls.utls.fingerprint // "chrome")}
+             + (if .tls.alpn then {alpn: .tls.alpn} else {} end)
+             + (if .tls.reality.enabled then
+                  {"reality-opts": {"public-key": .tls.reality.public_key, "short-id": (.tls.reality.short_id // "")}}
+                else {} end))
+          else {} end)
+       + (if .transport.type == "ws" then
+            {"ws-opts": ({path: (.transport.path // "/")}
+                         + (if .transport.headers then {headers: .transport.headers} else {} end))}
+          else {} end)
+       + (if .transport.type == "grpc" then
+            {"grpc-opts": {"grpc-service-name": (.transport.service_name // "")}}
+          else {} end))
+    elif .type == "shadowsocks" then
+      {name: "SERVER", type: "ss", server: .server, port: .server_port, cipher: .method, password: .password, udp: true}
+    else error("unsupported outbound type: \(.type)") end
+  '
+}
+
+# JSON array of mihomo rule strings from the rules file (same groups as before: switch,
+# `or`, outbound direct/else). "direct" -> DIRECT, anything else -> PROXY.
+compile_mihomo_rules() {
+  seed_rules_file_if_missing
+  run_root jq -c '
+    def rtype: {domain: "DOMAIN", domain_suffix: "DOMAIN-SUFFIX", domain_keyword: "DOMAIN-KEYWORD",
+                domain_regex: "DOMAIN-REGEX", ip_cidr: "IP-CIDR", port: "DST-PORT", port_range: "DST-PORT",
+                process_name: "PROCESS-NAME", network: "NETWORK"};
+    def vals($r; $k): [$r[$k][]? | tostring | if $k == "port_range" then gsub(":"; "-") else . end];
+    def term($k; $v): (if $k == "ip_cidr" and ($v | contains(":")) then "IP-CIDR6" else rtype[$k] end) + "," + $v;
+    def line($k; $v; $t): term($k; $v) + "," + $t + (if $k == "ip_cidr" then ",no-resolve" else "" end);
+    [ .rules[] | select(.switch == true) | . as $r
+      | (if $r.outbound == "direct" then "DIRECT" else "PROXY" end) as $t
+      | [ rtype | keys_unsorted[] | select(($r[.] // []) | length > 0) ] as $ks
+      | if ($ks | length) == 0 then empty
+        elif ($ks | length) == 1 or $r["or"] != false then
+          $ks[] as $k | vals($r; $k)[] as $v | line($k; $v; $t)
+        else
+          "AND,(" + ([ $ks[] as $k | vals($r; $k) as $vs
+            | if ($vs | length) == 1 then "(" + term($k; $vs[0]) + ")"
+              else "(OR,(" + ([ $vs[] | "(" + term($k; .) + ")" ] | join(",")) + "))" end
+          ] | join(",")) + ")," + $t
+        end
+    ]
+  ' "$RULES_FILE"
+}
+
+# Domain patterns of direct groups made only of domain fields: resolved by the system DNS
+# (corporate/split-DNS names that public DNS cannot answer) and kept out of fake-ip.
+# keyword/regex conditions cannot be expressed as DNS patterns and are skipped.
+compile_direct_domains() {
+  seed_rules_file_if_missing
+  run_root jq -c '
+    def conds: ["domain","domain_suffix","domain_keyword","domain_regex","ip_cidr","port","port_range","process_name","package_name","network","protocol"];
+    [ .rules[] | select(.switch == true and .outbound == "direct") | . as $r
+      | [ conds[] | select(($r[.] // []) | length > 0) ] as $ks
+      | select(($ks | length) > 0 and ($ks | all(. as $k | ["domain","domain_suffix","domain_keyword","domain_regex"] | index($k))))
+      | ($r.domain // [])[], (($r.domain_suffix // [])[] | "+." + .)
+    ] | unique
+  ' "$RULES_FILE"
+}
+
+# build_mihomo_config — prints the config JSON from ST_* (state globals) and CTL_*.
+build_mihomo_config() {
+  local rules direct auto_route
+  rules="$(compile_mihomo_rules)"
+  direct="$(compile_direct_domains)"
+  auto_route=false
+  [[ "$ST_SCOPE" == "all" ]] && auto_route=true
+  control_endpoint
 
   jq -n \
-    --argjson outbound "$outbound" \
-    --arg outbound_tag "$outbound_tag" \
-    --argjson auto_route "$auto_route_json" \
-    --argjson auto_redirect "$auto_redirect_json" \
-    --arg tun_name "${OS_TUN_INTERFACE:-}" \
-    --argjson custom_dns_rules "$custom_dns_rules_json" \
-    --argjson dashboard_enabled "$dashboard_enabled" \
-    --arg clash_bind "$CLASH_API_BIND" \
-    --arg clash_ui_dir "$CLASH_UI_DIR" '
-    {
-      log: { level: "info" },
-      dns: {
-        servers: [
-          {
-            type: "tls",
-            tag: "cloudflare",
-            server: "1.1.1.1"
-          },
-          {
-            type: "tls",
-            tag: "google",
-            server: "8.8.8.8"
-          },
-          {
-            type: "local",
-            tag: "local"
-          }
-        ],
-        rules: $custom_dns_rules,
-        final: "cloudflare"
-      },
-      inbounds: [
-        (
-          {
-            type: "tun",
-            tag: "tun-in",
-            address: ["198.18.0.1/30"],
-            auto_route: $auto_route,
-            auto_redirect: $auto_redirect,
-            strict_route: true,
-            mtu: 1500,
-            stack: "system"
-          }
-          + (if $tun_name != "" then {interface_name: $tun_name} else {} end)
-        )
-      ],
-      outbounds: [
-        $outbound,
-        { type: "direct", tag: "direct" }
-      ],
-      route: {
-        auto_detect_interface: true,
-        rules: [
-          { action: "sniff" },
-          { protocol: "dns", action: "hijack-dns" }
-        ],
-        final: $outbound_tag
-      }
-    }
-    + (
-      if $dashboard_enabled then
-        {
-          experimental: {
-            clash_api: {
-              external_controller: $clash_bind,
-              external_ui: $clash_ui_dir,
-              external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
-              external_ui_download_detour: "direct",
-              secret: "",
-              default_mode: "rule"
-            }
-          }
-        }
+    --arg mode "$ST_MODE" --arg url "$ST_URL" --arg primary "$ST_PRIMARY" \
+    --argjson proxy "$ST_PROXY" --argjson rules "$rules" --argjson direct "$direct" \
+    --argjson auto_route "$auto_route" --argjson auto_redirect "${OS_AUTO_REDIRECT:-false}" \
+    --arg tun_name "${OS_TUN_INTERFACE:-}" --argjson dashboard "$ST_DASH" \
+    --arg ctl_bind "$CTL_BIND" --arg ctl_secret "$CTL_SECRET" --arg ui_dir "$CLASH_UI_DIR" \
+    --arg probe "$PROBE_URL" --arg exclude "$SUB_EXCLUDE" --argjson refresh "$SUBSCRIPTION_REFRESH_SEC" '
+    def esc: gsub("(?<c>[.^$|?*+()\\[\\]{}\\\\])"; "\\" + .c);
+    def groups:
+      if $mode == "subscription" then
+        ([{name: "AUTO", type: "url-test", use: ["sub"], url: $probe, interval: 180, tolerance: 50}]
+         + (if $primary != "" then
+              # PRIMARY keeps REJECT as a member: with no node matching, an empty group would
+              # turn into DIRECT and look alive to the fallback group.
+              [{name: "PRIMARY", type: "url-test", proxies: ["REJECT"], use: ["sub"],
+                filter: ("^" + ($primary | esc) + "$"), url: $probe, interval: 20},
+               {name: "BACKUP", type: "url-test", use: ["sub"],
+                "exclude-filter": ("^" + ($primary | esc) + "$|" + $exclude),
+                url: $probe, interval: 30, tolerance: 50},
+               {name: "FAILOVER", type: "fallback", proxies: ["PRIMARY", "BACKUP"], url: $probe, interval: 20}]
+            else [] end)
+         + [{name: "PROXY", type: "select", use: ["sub"],
+             proxies: ((if $primary != "" then ["FAILOVER", "AUTO"] else ["AUTO"] end) + ["DIRECT"])}])
       else
-        {}
-      end
-    )
-  ' > "$tmp_config"
+        [{name: "PROXY", type: "select", proxies: ["SERVER", "DIRECT"]}]
+      end;
+    {
+      mode: "rule", "log-level": "info", "allow-lan": false, ipv6: false, "unified-delay": true,
+      "external-controller": $ctl_bind, secret: $ctl_secret,
+      profile: {"store-selected": true},
+      tun: ({enable: true, stack: "mixed", "auto-route": $auto_route, "auto-detect-interface": true,
+             "strict-route": $auto_route, "dns-hijack": ["any:53"], mtu: 1500}
+            + (if $tun_name != "" then {device: $tun_name} else {} end)
+            + (if $auto_redirect and $auto_route then {"auto-redirect": true} else {} end)
+            + (if $auto_route then {} else {"inet4-address": ["198.18.0.1/30"]} end)),
+      dns: ({enable: true, ipv6: false, "enhanced-mode": "fake-ip",
+             "default-nameserver": ["1.1.1.1", "8.8.8.8"],
+             nameserver: ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+             "proxy-server-nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]}
+            + (if ($direct | length) > 0 then
+                 {"fake-ip-filter": $direct, "nameserver-policy": ($direct | map({(.): "system"}) | add)}
+               else {} end)),
+      "proxy-groups": groups,
+      rules: ($rules + ["MATCH,PROXY"])
+    }
+    + (if $mode == "subscription" then
+        {"proxy-providers": {sub: {type: "http", url: $url, path: "./providers/sub.yaml", interval: $refresh,
+           "exclude-filter": $exclude,
+           "health-check": {enable: true, url: $probe, interval: 60}}}}
+       else {proxies: [$proxy]} end)
+    + (if $dashboard then
+        {"external-ui": $ui_dir,
+         "external-ui-url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"}
+       else {} end)
+  '
+}
 
+# apply_config [restart] — stdin: config JSON. Validates with mihomo itself, keeps a backup
+# of the previous file, installs the new one, then re-reads it in place through the API
+# (no restart, so a refresh or a rules change does not cut connections); restarts the
+# service when it is not running, the API call fails, or `restart` is passed.
+apply_config() {
+  local force="${1:-}" tmp errf backup
+  tmp="$(mktemp)"; errf="$(mktemp)"
+  cat > "$tmp"
   run_root install -d -m 0755 "$CONFIG_DIR"
+  run_root install -d -m 0700 "$PROVIDERS_DIR"
 
-  if [[ "$dashboard_enabled" == "true" ]]; then
-    run_root install -d -m 0755 "$CLASH_UI_DIR"
+  if ! run_root "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$tmp" >/dev/null 2>"$errf"; then
+    grep -E 'level=(error|fatal)|error' "$errf" >&2 || cat "$errf" >&2
+    rm -f "$tmp" "$errf"
+    die "mihomo rejected the generated config"
   fi
+  rm -f "$errf"
 
   if run_root test -f "$CONFIG_FILE"; then
-    backup_file="${CONFIG_DIR}/config.backup-$(date +%Y%m%d-%H%M%S).json"
-    run_root cp "$CONFIG_FILE" "$backup_file"
-    log "Previous config backup: $backup_file"
+    backup="${CONFIG_DIR}/config.backup-$(date +%Y%m%d-%H%M%S).yaml"
+    run_root cp "$CONFIG_FILE" "$backup"
+    # keep the five newest backups
+    run_root sh -c "ls -1t '${CONFIG_DIR}'/config.backup-*.yaml 2>/dev/null | tail -n +6 | xargs rm -f"
   fi
+  run_root install -m 0600 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
 
-  run_root install -m 0600 "$tmp_config" "$CONFIG_FILE"
-  rm -f "$tmp_config"
+  if [[ "$force" != "restart" ]] && os_service_is_active \
+     && api_call PUT "/configs?force=true" "$(jq -cn --arg p "$CONFIG_FILE" '{path: $p, payload: ""}')" >/dev/null 2>&1; then
+    log "Config re-read by the running mihomo (no restart)"
+    return 0
+  fi
+  os_service_restart
+  sleep 2
+}
+
+# rebuild_and_apply [restart] — regenerate the config from the saved state and apply it.
+rebuild_and_apply() {
+  load_state
+  [[ -n "$ST_MODE" ]] && run_root test -f "$STATE_FILE" || die "Configure the VPN first: $(basename "$0") configure or subscribe <url>"
+  build_mihomo_config | apply_config "${1:-}"
+}
+
+# Names of the servers in a subscription as a JSON array (what the provider will expose),
+# for the priority-server prompt. Same exclusion as the provider's exclude-filter.
+subscription_names() {
+  local text line name
+  text="$(fetch_subscription_url "$1")"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ "$line" == *"#"* ]] || continue
+    name="$(url_decode "${line#*#}")"
+    [[ -n "$name" ]] || continue
+    grep -qE "$SUB_EXCLUDE" <<<"$name" && continue
+    printf '%s\n' "$name"
+  done <<<"$text" | jq -R . | jq -s .
 }
 
 configure_vpn() {
   ensure_runtime_dependencies
-  ensure_cmd jq sing-box id
+  ensure_cmd jq curl "$MIHOMO_BIN"
   os_check_cmds
 
-  local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme dashboard_enabled sub_url
+  local input_type uri json_payload mode outbound sub_url dashboard_enabled user_scope include_uids_json
 
   # One question at a time: choose a format, paste it right away, only then move on to
   # rules, users and the dashboard.
   input_type="$(select_input_type)"
-  mode=""
   case "$input_type" in
     subscription)
-      ensure_cmd curl base64
+      ensure_cmd base64
       sub_url="$(read_subscription_url)"
       ;;
     url)
       echo
       read -r -p "Paste VPN URL: " uri
-      uri_scheme="$(detect_uri_scheme "$uri")"
-      [[ "$uri_scheme" != "unknown" ]] || die "Unsupported URI scheme. Expected vless:// or ss://"
+      [[ "$(detect_uri_scheme "$uri")" != "unknown" ]] || die "Unsupported URI scheme. Expected vless:// or ss://"
       outbound="$(build_outbound_from_uri "$uri")"
       ;;
     *)
@@ -909,84 +1027,71 @@ configure_vpn() {
       ;;
   esac
 
-  # Asked once here (never during the unattended `subscribe` background refresh) so it
-  # covers both the single-server and subscription paths.
+  # Asked once here (never during the unattended refresh) for both paths.
   select_rules_source
 
+  load_state
   if [[ "$input_type" == "subscription" ]]; then
     dashboard_enabled="$(select_dashboard_enabled)"
     [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
-    configure_subscription "$sub_url" "$dashboard_enabled" ask_primary
-    return
+    log "Downloading subscription..."
+    SUBSCRIPTION_TAGS_JSON="$(subscription_names "$sub_url")"
+    [[ "$(jq 'length' <<<"$SUBSCRIPTION_TAGS_JSON")" -gt 0 ]] || die "Could not find any server in the subscription"
+    SUB_PRIMARY="$ST_PRIMARY"
+    select_primary_server
+    ST_MODE="subscription"; ST_SCOPE="all"; ST_UIDS='[]'; ST_URL="$sub_url"
+    ST_PRIMARY="$SUB_PRIMARY"; ST_PROXY="null"
+  else
+    user_scope="$(select_user_scope)"
+    include_uids_json='[]'
+    [[ "$user_scope" == "selected" ]] && include_uids_json="$(read_selected_user_uids)"
+    dashboard_enabled="$(select_dashboard_enabled)"
+    [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
+    ST_MODE="single"; ST_SCOPE="$user_scope"; ST_UIDS="$include_uids_json"; ST_URL=""; ST_PRIMARY=""
+    ST_PROXY="$(sb_outbound_to_mihomo <<<"$outbound")" || die "This server type cannot be converted for mihomo"
   fi
+  ST_DASH="$dashboard_enabled"; ST_BIND="$CLASH_API_BIND"
 
-  user_scope="$(select_user_scope)"
-  include_uids_json='[]'
-
-  if [[ "$user_scope" == "selected" ]]; then
-    include_uids_json="$(read_selected_user_uids)"
-  fi
-
-  dashboard_enabled="$(select_dashboard_enabled)"
-  [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
-
-  write_config "$outbound" "$user_scope" "$dashboard_enabled"
-  write_state_file "$user_scope" "$include_uids_json" "$dashboard_enabled" "$CLASH_API_BIND"
+  save_state
   os_service_write
-
-  # Single-server mode has no subscription to refresh — drop any leftover
-  # subscription state and background refresh timer from a previous `subscribe`.
-  run_root rm -f "$SUBSCRIPTION_STATE_FILE"
-  os_subscription_timer_disable
-  os_subscription_timer_remove
-
-  if [[ "$user_scope" == "selected" ]]; then
+  if [[ "$ST_SCOPE" == "selected" ]]; then
     clear_selected_routing
     clear_legacy_sing_box_routing
   else
     clear_selected_routing
+    remove_custom_nft_files
   fi
-
   os_service_reload
   os_service_enable >/dev/null
+  build_mihomo_config | apply_config restart
+  report_result
+}
 
-  run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE"
-  restart_service
-  sleep 2
-
-  if os_service_is_active; then
-    local current_ip
-    current_ip=""
-
-    if command -v curl >/dev/null 2>&1; then
-      current_ip="$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-      [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://ifconfig.me 2>/dev/null || true)"
-      [[ -n "$current_ip" ]] || current_ip="$(curl -fsSL --max-time 8 https://2ip.ru 2>/dev/null || true)"
-    fi
-
-    if [[ "$user_scope" == "selected" ]]; then
-      log "VPN config applied. Selected-users mode uses Linux nftables + ip rule by UID."
-    else
-      log "VPN config applied. All users mode is active."
-    fi
-
-    if [[ -n "$current_ip" ]]; then
-      echo "[INFO] Your current public IP: $current_ip"
-    else
-      echo "[INFO] Could not detect public IP automatically."
-    fi
+report_result() {
+  local current_ip
+  os_service_is_active || die "mihomo failed to start. Run: $(basename "$0") logs"
+  current_ip="$(detect_public_ip)"
+  if [[ "$ST_MODE" == "subscription" ]]; then
+    log "Subscription applied. mihomo refreshes it itself every ${SUBSCRIPTION_REFRESH_SEC}s."
+  elif [[ "$ST_SCOPE" == "selected" ]]; then
+    log "VPN config applied. Selected-users mode uses Linux nftables + ip rule by UID."
   else
-    die "sing-box failed to start. Run: $(basename "$0") logs"
+    log "VPN config applied. All users mode is active."
+  fi
+  if [[ "$ST_DASH" == "true" ]]; then
+    echo "[INFO] Dashboard: http://${ST_BIND}/ui/ (reachable only from ${ST_BIND%%:*})"
+  else
+    echo "[INFO] Dashboard is disabled. Enable it via: $(basename "$0") reconfigure"
+  fi
+  if [[ -n "$current_ip" ]]; then
+    echo "[INFO] Your current public IP: $current_ip"
+  else
+    echo "[INFO] Could not detect public IP automatically."
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Subscription mode: fetch a subscription URL, turn every entry into a
-# sing-box outbound (reusing build_outbound_from_uri), group them into a
-# selector ("proxy") + urltest ("auto") pair, and optionally (only if the
-# caller opted in) enable the built-in clash_api + external_ui dashboard
-# (metacubexd) so servers/ping/speed/pick can be managed from a browser
-# instead of the CLI.
+# Subscription helpers
 # ---------------------------------------------------------------------------
 
 decode_subscription_text() {
@@ -1010,55 +1115,6 @@ fetch_subscription_url() {
   local url="$1" raw
   raw="$(curl -fsSL --compressed --max-time 20 "$url")" || die "Could not download subscription: $url"
   decode_subscription_text "$raw"
-}
-
-# Populates globals SUBSCRIPTION_TAGS_JSON / SUBSCRIPTION_PROXIES_JSON.
-build_outbounds_from_subscription() {
-  local text="$1"
-  local -a tags=()
-  local -a items=()
-  local seen_names=$'\n'
-  local line frag name base n outbound scheme
-
-  while IFS= read -r line; do
-    line="${line%$'\r'}"
-    [[ -z "$line" ]] && continue
-
-    scheme="$(detect_uri_scheme "$line")"
-    if [[ "$scheme" == "unknown" ]]; then
-      warn "Skipped subscription line (unknown scheme)"
-      continue
-    fi
-
-    if [[ "$line" == *"#"* ]]; then
-      name="$(url_decode "${line#*#}")"
-    else
-      name="node-$(( ${#items[@]} + 1 ))"
-    fi
-    [[ -n "$name" ]] || name="node-$(( ${#items[@]} + 1 ))"
-
-    base="$name"
-    n=2
-    while [[ "$seen_names" == *$'\n'"$name"$'\n'* ]]; do
-      name="${base} #${n}"
-      n=$((n + 1))
-    done
-    seen_names="${seen_names}${name}"$'\n'
-
-    if ! outbound="$(build_outbound_from_uri "$line" "" 2>/dev/null)"; then
-      warn "Skipped node (could not parse): $name"
-      continue
-    fi
-
-    outbound="$(jq -c --arg tag "$name" '.tag = $tag' <<<"$outbound")"
-    tags+=("$name")
-    items+=("$outbound")
-  done <<<"$text"
-
-  [[ ${#items[@]} -gt 0 ]] || die "Could not parse any server from the subscription"
-
-  SUBSCRIPTION_TAGS_JSON="$(printf '%s\n' "${tags[@]}" | jq -R . | jq -s .)"
-  SUBSCRIPTION_PROXIES_JSON="$(printf '%s\n' "${items[@]}" | jq -s .)"
 }
 
 seed_rules_file_if_missing() {
@@ -1088,643 +1144,88 @@ seed_rules_file_if_missing() {
 
   if [[ -n "$source_desc" ]]; then
     log "Created rules file from seed ($source_desc): $RULES_FILE"
-    warn "process_name/port rules only match traffic that originates on this box itself (sing-box runs on the router, not on client devices) — domain/ip_cidr rules still work normally for hotspot clients."
+    warn "process_name/port rules only match traffic that originates on this box itself (mihomo runs on the router, not on client devices) — domain/ip_cidr rules still work normally for hotspot clients."
   else
     log "Created empty rules file: $RULES_FILE (add groups with: $(basename "$0") rules edit, or set VPNC_RULES_SEED_PATH/VPNC_RULES_SEED_URL before first use)"
   fi
 }
 
-compile_custom_rules() {
-  seed_rules_file_if_missing
-
-  run_root jq -c '
-    def cond_keys: ["domain","domain_suffix","domain_keyword","domain_regex","ip_cidr","port","port_range","process_name","package_name","network","protocol"];
-    [
-      .rules[]
-      | select(.switch == true)
-      | . as $r
-      | (cond_keys | map(select($r[.] != null and ($r[.] | length) > 0))) as $keys
-      | select(($keys | length) > 0)
-      | if ($keys | length) == 1 then
-          { ($keys[0]): $r[$keys[0]], outbound: $r.outbound }
-        else
-          {
-            type: "logical",
-            mode: (if $r.or == false then "and" else "or" end),
-            rules: [ $keys[] as $k | { ($k): $r[$k] } ],
-            outbound: $r.outbound
-          }
-        end
-    ]
-  ' "$RULES_FILE"
-}
-
-# Derives dns.rules from the same rules file as compile_custom_rules: any *domain-only*
-# group routed "direct" also gets its DNS queries answered by the "local" (OS/system
-# resolver) DNS server instead of the hijacked cloudflare/google one. Needed for
-# corp/internal hostnames (e.g. behind Cisco AnyConnect's split-DNS) that plain public
-# DNS can't resolve — matching them for direct routing alone isn't enough if the queried
-# name never resolves in the first place. ip_cidr/port/process_name/network conditions
-# don't carry meaning for DNS lookups, so groups using only those are left out (DNS
-# still resolves via cloudflare/google for them, which is what you want for pure IP or
-# process-based rules).
-compile_custom_dns_rules() {
-  local compiled
-  compiled="$(compile_custom_rules)"
-
-  jq -c '
-    def domain_keys: ["domain","domain_suffix","domain_keyword","domain_regex"];
-    [
-      .[]
-      | select(.outbound == "direct")
-      | select(
-          if .type == "logical" then
-            (.rules | all(keys[0] as $k | (domain_keys | index($k)) != null))
-          else
-            (((keys - ["outbound"])[0]) as $k | (domain_keys | index($k)) != null)
-          end
-        )
-      | (del(.outbound) + {server: "local"})
-    ]
-  ' <<<"$compiled"
-}
-
-write_subscription_config() {
-  local dashboard_enabled="${1:-false}"
-  local tmp_config backup_file custom_rules_json custom_dns_rules_json
-
-  custom_rules_json="$(compile_custom_rules)"
-  custom_dns_rules_json="$(compile_custom_dns_rules)"
-  tmp_config="$(mktemp)"
-
-  jq -n \
-    --argjson proxies "$SUBSCRIPTION_PROXIES_JSON" \
-    --argjson tags "$SUBSCRIPTION_TAGS_JSON" \
-    --argjson custom_rules "$custom_rules_json" \
-    --argjson custom_dns_rules "$custom_dns_rules_json" \
-    --argjson auto_redirect "${OS_AUTO_REDIRECT:-false}" \
-    --arg tun_name "${OS_TUN_INTERFACE:-}" \
-    --argjson dashboard_enabled "$dashboard_enabled" \
-    --arg clash_bind "$CLASH_API_BIND" \
-    --arg clash_ui_dir "$CLASH_UI_DIR" \
-    --arg primary "$SUB_PRIMARY" \
-    --arg control_bind "$SUB_CONTROL_BIND" \
-    --arg control_secret "$SUB_CONTROL_SECRET" \
-    '
-    {
-      log: { level: "info" },
-      dns: {
-        servers: [
-          { type: "tls", tag: "cloudflare", server: "1.1.1.1" },
-          { type: "tls", tag: "google", server: "8.8.8.8" },
-          { type: "local", tag: "local" }
-        ],
-        rules: $custom_dns_rules,
-        final: "cloudflare"
-      },
-      inbounds: [
-        (
-          {
-            type: "tun",
-            tag: "tun-in",
-            address: ["198.18.0.1/30"],
-            auto_route: true,
-            auto_redirect: $auto_redirect,
-            strict_route: true,
-            mtu: 1500,
-            stack: "system"
-          }
-          + (if $tun_name != "" then {interface_name: $tun_name} else {} end)
-        )
-      ],
-      outbounds: (
-        [{ type: "selector", tag: "proxy", outbounds: (["auto"] + $tags + ["direct"]), default: (if ($primary != "" and ($tags | index($primary))) then $primary else "auto" end) }]
-        + [{ type: "urltest", tag: "auto", outbounds: $tags, url: "https://www.gstatic.com/generate_204", interval: "3m", tolerance: 50 }]
-        + $proxies
-        + [{ type: "direct", tag: "direct" }]
-      ),
-      route: {
-        auto_detect_interface: true,
-        default_domain_resolver: "cloudflare",
-        rules: ([{ action: "sniff" }, { protocol: "dns", action: "hijack-dns" }] + $custom_rules),
-        final: "proxy"
-      }
-    }
-    # clash_api is always on in subscription mode: vpnc itself uses it to ping servers and
-    # switch the selector (see cmd_tick). The web UI part stays opt-in.
-    + {
-      experimental: {
-        clash_api: (
-          { external_controller: $control_bind, secret: $control_secret, default_mode: "rule" }
-          + (
-            if $dashboard_enabled then
-              {
-                external_ui: $clash_ui_dir,
-                external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
-                external_ui_download_detour: "direct"
-              }
-            else
-              {}
-            end
-          )
-        )
-      }
-    }
-    ' > "$tmp_config"
-
-  run_root install -d -m 0755 "$CONFIG_DIR"
-
-  if [[ "$dashboard_enabled" == "true" ]]; then
-    run_root install -d -m 0755 "$CLASH_UI_DIR"
-  fi
-
-  # Periodic refresh (see os_subscription_timer_*) re-downloads the subscription and
-  # calls back in here every $SUBSCRIPTION_REFRESH_SEC — if the server list is the same
-  # bytes as last time, skip the backup+install+restart so sing-box doesn't drop active
-  # connections on ticks where nothing actually changed. Sets SUBSCRIPTION_CONFIG_CHANGED
-  # for the caller.
-  SUBSCRIPTION_CONFIG_CHANGED="true"
-  SUBSCRIPTION_RESTART_NEEDED="true"
-  if run_root test -f "$CONFIG_FILE" && run_root cmp -s "$tmp_config" "$CONFIG_FILE"; then
-    SUBSCRIPTION_CONFIG_CHANGED="false"
-    SUBSCRIPTION_RESTART_NEEDED="false"
-    rm -f "$tmp_config"
-    return
-  fi
-  # A changed file does not always need a restart: if the servers in use are untouched the
-  # new config is only written to disk and takes effect at the next restart.
-  config_restart_needed "$tmp_config" || SUBSCRIPTION_RESTART_NEEDED="false"
-
-  if run_root test -f "$CONFIG_FILE"; then
-    backup_file="${CONFIG_DIR}/config.backup-$(date +%Y%m%d-%H%M%S).json"
-    run_root cp "$CONFIG_FILE" "$backup_file"
-    log "Previous config backup: $backup_file"
-  fi
-
-  run_root install -m 0600 "$tmp_config" "$CONFIG_FILE"
-  rm -f "$tmp_config"
-}
-
-# Shared by configure_vpn's "subscription" input type and the standalone
-# `subscribe` command. dashboard_enabled must already be decided by the
-# caller (interactively, or carried over from a previously saved
-# subscription) — it is never turned on implicitly.
-configure_subscription() {
-  local url="$1"
-  local dashboard_enabled="${2:-false}"
-  local ask_primary="${3:-}"
-
+# `vpnc subscribe [url]` — without a URL: ask mihomo to refresh the saved subscription now
+# (it also does it on its own every SUBSCRIPTION_REFRESH_SEC). With a URL: switch to it,
+# reusing the saved dashboard choice (asked once when there is no saved state).
+subscribe_vpn() {
   ensure_runtime_dependencies
-  ensure_cmd jq sing-box curl base64
+  ensure_cmd jq curl "$MIHOMO_BIN"
   os_check_cmds
 
-  load_subscription_extras "$dashboard_enabled"
+  local url="${1:-}" dashboard_enabled
+  load_state
 
-  log "Downloading subscription..."
-  local text server_count
-  text="$(fetch_subscription_url "$url")"
+  if [[ -z "$url" ]]; then
+    [[ "$ST_MODE" == "subscription" && -n "$ST_URL" ]] \
+      || die "No saved subscription. Usage: $(basename "$0") subscribe <url>"
+    api_call PUT /providers/proxies/sub >/dev/null \
+      || die "Could not reach mihomo's API; is the service running? ($(basename "$0") status)"
+    log "Subscription refresh requested (servers are replaced in place, connections stay)"
+    return 0
+  fi
 
-  build_outbounds_from_subscription "$text"
-  server_count="$(jq 'length' <<<"$SUBSCRIPTION_TAGS_JSON")"
-  log "Parsed servers: $server_count"
-  [[ "$ask_primary" == "ask_primary" ]] && select_primary_server
+  if run_root test -f "$STATE_FILE"; then
+    [[ "$ST_URL" == "$url" ]] || ST_PRIMARY=""
+  else
+    dashboard_enabled="$(select_dashboard_enabled)"
+    ST_DASH="$dashboard_enabled"
+    [[ "$dashboard_enabled" == "true" ]] && ST_BIND="$(select_clash_api_bind)"
+  fi
+  ST_MODE="subscription"; ST_SCOPE="all"; ST_UIDS='[]'; ST_URL="$url"; ST_PROXY="null"
 
-  write_subscription_config "$dashboard_enabled"
+  save_state
   os_service_write
-
-  local tmp_state
-  tmp_state="$(mktemp)"
-  jq -n \
-    --arg url "$url" \
-    --argjson count "$server_count" \
-    --arg fetched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --argjson dashboard_enabled "$dashboard_enabled" \
-    --arg clash_api_bind "$CLASH_API_BIND" \
-    --argjson fetched_epoch "$(date +%s)" \
-    --arg primary "$SUB_PRIMARY" \
-    --arg api_secret "$SUB_API_SECRET" \
-    --arg control_bind "$SUB_CONTROL_BIND" \
-    --arg control_secret "$SUB_CONTROL_SECRET" \
-    '{url: $url, proxy_count: $count, fetched_at: $fetched_at, fetched_epoch: $fetched_epoch, dashboard_enabled: $dashboard_enabled, clash_api_bind: $clash_api_bind, primary: $primary, api_secret: $api_secret, control_bind: $control_bind, control_secret: $control_secret}' > "$tmp_state"
-  run_root install -d -m 0755 "$CONFIG_DIR"
-  run_root install -m 0600 "$tmp_state" "$SUBSCRIPTION_STATE_FILE"
-  rm -f "$tmp_state"
-
-  # Subscription mode is always full-tunnel; drop any leftover selected-users state/rules.
-  run_root rm -f "$STATE_FILE"
   clear_selected_routing
   clear_legacy_sing_box_routing
   remove_custom_nft_files
-
   os_service_reload
   os_service_enable >/dev/null
-  run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE"
-
-  # Only restart (and drop active connections) when the config actually changed, or
-  # when sing-box isn't already running — matters for the periodic refresh timer,
-  # which calls this every $SUBSCRIPTION_REFRESH_SEC even if the server list is stable.
-  if [[ "$SUBSCRIPTION_RESTART_NEEDED" == "true" ]] || ! os_service_is_active; then
-    restart_service
-    sleep 2
-  elif [[ "$SUBSCRIPTION_CONFIG_CHANGED" == "true" ]]; then
-    log "Subscription updated ($server_count servers) — servers in use unchanged, kept the running connection (new list applies at the next restart)"
-  else
-    log "Subscription unchanged ($server_count servers) — kept the running connection"
-  fi
-
-  # Skip when already on: this same function runs every time the background timer
-  # fires `vpnc subscribe` on itself, and os_subscription_timer_enable() bootouts +
-  # reloads the launchd/systemd job — doing that from inside the job's own running
-  # instance is a self-unload race that can leave the timer not reloaded. Only
-  # (re)provision when it's actually missing (first run, or after `configure` switched
-  # back from single-server mode).
-  # Installs from before the failover watcher have a job that runs `subscribe`; an
-  # interactive run swaps it for `_tick` (never from the job itself: VPNC_FROM_TIMER).
-  if [[ "$(os_subscription_timer_status)" == "off" ]] \
-    || { [[ -z "${VPNC_FROM_TIMER:-}" ]] && ! run_root grep -q '_tick' "$SUBSCRIPTION_SERVICE_FILE" 2>/dev/null; }; then
-    os_subscription_timer_write "$WATCH_INTERVAL_SEC"
-    os_subscription_timer_enable
-  fi
-
-  if os_service_is_active; then
-    local timer_status
-    timer_status="$(os_subscription_timer_status)"
-    if [[ "$timer_status" == "off" ]]; then
-      warn "Background refresh timer is NOT enabled — subscription will not auto-update."
-      warn "To fix: run with sudo, e.g.  sudo $(basename "$0") subscribe"
-    else
-      log "Subscription applied ($server_count servers). Background refresh $timer_status."
-    fi
-    if [[ "$dashboard_enabled" == "true" ]]; then
-      echo "[INFO] Dashboard: http://${CLASH_API_BIND}/ui/ (reachable only from ${CLASH_API_BIND%%:*})"
-    else
-      echo "[INFO] Dashboard is disabled. Enable it via: $(basename "$0") reconfigure"
-    fi
-  else
-    die "sing-box failed to start. Run: $(basename "$0") logs"
-  fi
+  build_mihomo_config | apply_config
+  report_result
 }
 
-# `vpnc subscribe [url]` — refreshes a previously saved subscription (reusing
-# its saved dashboard preference) or, given a fresh URL with no prior
-# subscription on file, asks once whether to enable the dashboard.
-subscribe_vpn() {
-  ensure_runtime_dependencies
-  ensure_cmd jq sing-box curl base64
-  os_check_cmds
-
-  local url="${1:-}" dashboard_enabled="false"
-  local have_state="0"
-  run_root test -f "$SUBSCRIPTION_STATE_FILE" && have_state="1"
-
-  if [[ -z "$url" ]]; then
-    [[ "$have_state" == "1" ]] || die "No saved subscription. Usage: $(basename "$0") subscribe <url>"
-    url="$(run_root jq -r '.url // empty' "$SUBSCRIPTION_STATE_FILE")"
-    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$SUBSCRIPTION_STATE_FILE")"
-    CLASH_API_BIND="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$SUBSCRIPTION_STATE_FILE")"
-    [[ -n "$url" ]] || die "No saved subscription. Usage: $(basename "$0") subscribe <url>"
-  elif [[ "$have_state" == "1" ]]; then
-    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$SUBSCRIPTION_STATE_FILE")"
-    CLASH_API_BIND="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$SUBSCRIPTION_STATE_FILE")"
-  else
-    dashboard_enabled="$(select_dashboard_enabled)"
-    [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
-  fi
-
-  configure_subscription "$url" "$dashboard_enabled"
-}
-
-# ---------------------------------------------------------------------------
-# Failover watcher. Optional "priority config" (`vpnc primary <name>`): the selector
-# `proxy` sits on that server; the background tick pings servers through sing-box's
-# clash_api and, when the priority server stops answering, first looks for an updated
-# config of that location in the subscription, then falls back to the fastest live
-# server and returns to the priority one as soon as it is alive again. Without a
-# priority server the tick only refreshes the subscription.
-# ---------------------------------------------------------------------------
-
-# Sets SUB_PRIMARY / SUB_API_SECRET / SUB_CONTROL_BIND / SUB_CONTROL_SECRET from the saved
-# subscription state (so a refresh keeps the choice and doesn't churn the config bytes).
-load_subscription_extras() {
-  local dashboard_enabled="${1:-false}"
-  SUB_PRIMARY=""
-  SUB_API_SECRET=""
-  if run_root test -f "$SUBSCRIPTION_STATE_FILE"; then
-    SUB_PRIMARY="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
-    SUB_API_SECRET="$(run_root jq -r '.api_secret // ""' "$SUBSCRIPTION_STATE_FILE")"
-  fi
-  [[ -n "$SUB_API_SECRET" ]] || SUB_API_SECRET="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-
-  if [[ "$dashboard_enabled" == "true" ]]; then
-    SUB_CONTROL_BIND="$CLASH_API_BIND"
-    SUB_CONTROL_SECRET=""
-  else
-    SUB_CONTROL_BIND="$CONTROL_BIND_DEFAULT"
-    SUB_CONTROL_SECRET="$SUB_API_SECRET"
-  fi
-}
-
-# api_call METHOD PATH [JSON_BODY] — talks to the running sing-box clash_api.
-api_call() {
-  local method="$1" path="$2" body="${3:-}" bind secret
-  bind="$(run_root jq -r '.control_bind // empty' "$SUBSCRIPTION_STATE_FILE")"
-  secret="$(run_root jq -r '.control_secret // ""' "$SUBSCRIPTION_STATE_FILE")"
-  [[ -n "$bind" ]] || return 1
-  if [[ -n "$body" ]]; then
-    curl -fsS --max-time 8 -X "$method" -H "Authorization: Bearer ${secret}" \
-      -H 'Content-Type: application/json' -d "$body" "http://${bind}${path}"
-  else
-    curl -fsS --max-time 8 -X "$method" -H "Authorization: Bearer ${secret}" "http://${bind}${path}"
-  fi
-}
-
-uri_encode() {
-  jq -rn --arg v "$1" '$v | @uri'
-}
-
-# Real server tags (no selector/urltest/direct) from the running config, one per line.
-subscription_tags() {
-  run_root jq -r '.outbounds[] | select(.type | IN("selector", "urltest", "direct") | not) | .tag' "$CONFIG_FILE"
-}
-
-# Delay in ms through one server, or 0 when it does not answer.
-probe_delay() {
-  local out
-  out="$(api_call GET "/proxies/$(uri_encode "$1")/delay?url=$(uri_encode "$PROBE_URL")&timeout=4000" 2>/dev/null)" || { echo 0; return; }
-  jq -r '.delay // 0' <<<"$out" 2>/dev/null || echo 0
-}
-
-# probe_all DIR — writes DIR/<n> = "<delay>\t<tag>" for every server, 8 probes at a time.
-probe_all() {
-  local dir="$1" n=0 tag
-  while IFS= read -r tag; do
-    [[ -n "$tag" ]] || continue
-    n=$((n + 1))
-    ( printf '%s\t%s\n' "$(probe_delay "$tag")" "$tag" > "$dir/$n" ) &
-    (( n % 8 )) || wait
-  done < <(subscription_tags)
-  wait
-}
-
-restart_service() {
-  os_service_restart
-  run_root install -m 0600 "$CONFIG_FILE" "$RUNNING_FILE" 2>/dev/null || true
-}
-
-# active_leaf — the server traffic goes through right now (selector choice, or its urltest
-# pick when on "auto"). Fails when clash_api is unreachable.
-active_leaf() {
-  local now leaf
-  now="$(api_call GET /proxies/proxy 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || return 1
-  [[ -n "$now" ]] || return 1
-  leaf="$now"
-  if [[ "$now" == "auto" ]]; then
-    leaf="$(api_call GET /proxies/auto 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || return 1
-  fi
-  [[ -n "$leaf" ]] || return 1
-  echo "$leaf"
-}
-
-# config_restart_needed NEW_CONFIG — exit 0 (restart) unless it is certain that only the
-# server list changed. Server definitions are NOT a reason to restart: providers rotate
-# tls/reality parameters every few minutes, and a running connection keeps working with the
-# definition it started with. Changed definitions wait on disk until the server stops
-# answering (cmd_tick -> watch_apply_pending) or until the next restart. Everything outside
-# `outbounds` (dns, route rules, inbounds, clash_api) changing needs a restart. Any doubt
-# (no baseline, service down, jq error) means restart.
-config_restart_needed() {
-  local new="$1" old="$RUNNING_FILE" res
-  run_root test -f "$old" || old="$CONFIG_FILE"
-  run_root test -f "$old" || return 0
-  os_service_is_active || return 0
-  res="$(run_root jq -n --slurpfile o "$old" --slurpfile n "$new" \
-    '($o[0] | del(.outbounds)) != ($n[0] | del(.outbounds))' 2>/dev/null)" || return 0
-  [[ "$res" == "false" ]] && return 1
-  return 0
-}
-
-# config_pending — the config on disk differs from what sing-box was started with.
-config_pending() {
-  run_root test -f "$RUNNING_FILE" && ! run_root cmp -s "$CONFIG_FILE" "$RUNNING_FILE"
-}
-
-watch_get() {
-  local key="$1" default="$2" v=""
-  if run_root test -f "$WATCH_FILE"; then
-    v="$(run_root jq -r --arg k "$key" '.[$k] // empty | tostring' "$WATCH_FILE" 2>/dev/null || true)"
-  fi
-  echo "${v:-$default}"
-}
-
-# watch_save FAIL OK FAILOVER REFRESHED  (other keys, e.g. last_attempt, are kept)
-watch_save() {
-  local tmp base
-  tmp="$(mktemp)"
-  base='{}'
-  run_root test -f "$WATCH_FILE" && base="$(run_root cat "$WATCH_FILE")"
-  jq -n --argjson base "$base" --argjson fail "$1" --argjson ok "$2" --argjson failover "$3" --argjson refreshed "$4" \
-    '$base + {fail: $fail, ok: $ok, failover: $failover, refreshed: $refreshed}' > "$tmp"
-  run_root install -m 0600 "$tmp" "$WATCH_FILE"
-  rm -f "$tmp"
-}
-
-# watch_set KEY JSON_VALUE
-watch_set() {
-  local tmp base
-  tmp="$(mktemp)"
-  base='{}'
-  run_root test -f "$WATCH_FILE" && base="$(run_root cat "$WATCH_FILE")"
-  jq -n --argjson base "$base" --arg k "$1" --argjson v "$2" '$base + {($k): $v}' > "$tmp"
-  run_root install -m 0600 "$tmp" "$WATCH_FILE"
-  rm -f "$tmp"
-}
-
-watch_mark_attempt() {
-  watch_set last_attempt "$(date +%s)"
-}
-
-# Re-fetch the subscription when SUBSCRIPTION_REFRESH_SEC passed since the last fetch or
-# attempt (failed fetches are retried at the same pace, not every tick). $1 = "force".
-watch_refresh() {
-  local force="${1:-}" now last fetched
-  now="$(date +%s)"
-  fetched="$(run_root jq -r '.fetched_epoch // 0' "$SUBSCRIPTION_STATE_FILE")"
-  last="$(watch_get last_attempt 0)"
-  (( fetched > last )) && last="$fetched"
-  if [[ "$force" != "force" ]] && (( now - last < SUBSCRIPTION_REFRESH_SEC )); then
-    return 0
-  fi
-  watch_mark_attempt
-  # Background subshell + wait: keeps `set -e` active inside subscribe_vpn (a plain
-  # `( ... ) || warn` would switch it off and e.g. a failed `sing-box check` would not stop the restart).
-  ( subscribe_vpn ) &
-  wait $! || warn "Subscription refresh failed; keeping the running config"
-}
-
-# switch_to TAG REASON
-switch_to() {
-  api_call PUT /proxies/proxy "$(jq -cn --arg n "$1" '{name: $n}')" >/dev/null \
-    && log "Failover: switched to '$1' ($2)" \
-    || warn "Could not switch to '$1' via clash_api"
-}
-
-# best_alive DIR EXCLUDE... — fastest tag with delay > 0 not in EXCLUDE.
-best_alive() {
-  local dir="$1" best="" best_ms=0 f ms tag ex skip
-  shift
-  for f in "$dir"/*; do
-    [[ -f "$f" ]] || continue
-    IFS=$'\t' read -r ms tag < "$f"
-    (( ms > 0 )) || continue
-    skip=0
-    for ex in "$@"; do [[ "$tag" == "$ex" ]] && skip=1; done
-    (( skip )) && continue
-    if [[ -z "$best" ]] || (( ms < best_ms )); then best="$tag"; best_ms="$ms"; fi
-  done
-  echo "$best"
-}
-
-delay_in_dir() {
-  local dir="$1" want="$2" f ms tag
-  for f in "$dir"/*; do
-    [[ -f "$f" ]] || continue
-    IFS=$'\t' read -r ms tag < "$f"
-    [[ "$tag" == "$want" ]] && { echo "$ms"; return; }
-  done
-  echo 0
-}
-
-watch_failover() {
-  local primary now dir fail ok failover refreshed p_ms now_ms alt
-  primary="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
-  [[ -n "$primary" ]] || return 0
-
-  now="$(api_call GET /proxies/proxy 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || return 0
-  [[ -n "$now" ]] || return 0   # sing-box not up (restarting) — try again next tick
-
-  if ! subscription_tags | grep -qxF -- "$primary"; then
-    warn "Priority server '$primary' is not in the subscription any more — failover idle"
-    return 0
-  fi
-
-  dir="$(mktemp -d)"
-  probe_all "$dir"
-  p_ms="$(delay_in_dir "$dir" "$primary")"
-  now_ms="$(delay_in_dir "$dir" "$now")"
-
-  fail="$(watch_get fail 0)"; ok="$(watch_get ok 0)"
-  failover="$(watch_get failover false)"; refreshed="$(watch_get refreshed false)"
-
-  if (( p_ms > 0 )); then ok=$((ok + 1)); fail=0; refreshed=false
-  else fail=$((fail + 1)); ok=0; fi
-
-  if [[ "$now" == "$primary" ]]; then
-    failover=false
-    if (( fail >= WATCH_FAIL_TICKS )); then
-      if [[ "$refreshed" == "false" ]]; then
-        # Maybe the provider already published a new config for this location.
-        refreshed=true
-        warn "Priority server '$primary' is not answering — refreshing the subscription for an updated config"
-        watch_save "$fail" "$ok" "$failover" "$refreshed"
-        watch_refresh force
-        # A newer definition of this server may be waiting on disk (see config_restart_needed).
-        if config_pending; then
-          log "Applying the pending config (restart) for '$primary'"
-          restart_service
-        fi
-        rm -rf "$dir"
-        return 0
-      fi
-      alt="$(best_alive "$dir" "$primary")"
-      if [[ -n "$alt" ]]; then
-        switch_to "$alt" "priority server '$primary' is down"
-        failover=true
-      else
-        warn "Priority server '$primary' is down and no other server answers"
-      fi
-    fi
-  elif [[ "$failover" == "true" ]]; then
-    if (( ok >= WATCH_OK_TICKS )); then
-      switch_to "$primary" "priority server is back"
-      failover=false
-    elif (( now_ms <= 0 )); then
-      alt="$(best_alive "$dir" "$primary" "$now")"
-      [[ -n "$alt" ]] && switch_to "$alt" "'$now' stopped answering"
-    fi
-  fi
-  # now != primary and no failover of ours → the user picked it by hand; leave it.
-
-  watch_save "$fail" "$ok" "$failover" "$refreshed"
-  rm -rf "$dir"
-}
-
-# `vpnc _tick` — run by the background timer/job. Quiet unless something happens.
-cmd_tick() {
-  export VPNC_FROM_TIMER=1
-  run_root test -f "$SUBSCRIPTION_STATE_FILE" || return 0
-  ensure_cmd jq curl
-  watch_refresh
-  watch_apply_pending
-  watch_failover
-}
-
-# New server definitions are written to disk without restarting (see config_restart_needed).
-# When the server in use stops answering WATCH_FAIL_TICKS ticks in a row, restart onto the
-# new config — it may be exactly what fixes it. Only for the no-priority case; with a
-# priority server watch_failover handles it.
-watch_apply_pending() {
-  local leaf n
-  [[ -z "$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")" ]] || return 0
-  if ! config_pending; then watch_set pend_fail 0; return 0; fi
-  leaf="$(active_leaf)" || return 0
-  if (( $(probe_delay "$leaf") > 0 )); then watch_set pend_fail 0; return 0; fi
-  n=$(( $(watch_get pend_fail 0) + 1 ))
-  watch_set pend_fail "$n"
-  if (( n >= WATCH_FAIL_TICKS )); then
-    warn "Server '$leaf' is not answering and a newer config is waiting — restarting onto it"
-    restart_service
-    watch_set pend_fail 0
-  fi
-}
-
-# `vpnc primary [name|number|off]` — show / set / clear the priority server.
+# `vpnc primary [name|number|off]` — show / set / clear the priority server (advanced).
+# mihomo's fallback group does the rest: stays on it, drops to the backup group when it
+# stops answering, returns as soon as it answers again.
 cmd_primary() {
-  local arg="${1:-}" cur tags n=0 tag target="" tmp
-  run_root test -f "$SUBSCRIPTION_STATE_FILE" || die "Priority server needs a subscription: $(basename "$0") subscribe <url>"
-  ensure_cmd jq
-  cur="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
-  tags="$(subscription_tags)"
+  local arg="${1:-}" names n=0 name target=""
+  ensure_cmd jq curl
+  load_state
+  [[ "$ST_MODE" == "subscription" && -n "$ST_URL" ]] \
+    || die "Priority server needs a subscription: $(basename "$0") subscribe <url>"
 
   if [[ -z "$arg" ]]; then
-    echo "Priority server: ${cur:-(none)}"
-    while IFS= read -r tag; do
+    names="$(subscription_names "$ST_URL")"
+    echo "Priority server: ${ST_PRIMARY:-(none)}"
+    while IFS= read -r name; do
       n=$((n + 1))
-      printf '  %2d) %s%s\n' "$n" "$tag" "$([[ "$tag" == "$cur" ]] && echo '  <- priority')"
-    done <<<"$tags"
+      printf '  %2d) %s%s\n' "$n" "$name" "$([[ "$name" == "$ST_PRIMARY" ]] && echo '  <- priority')"
+    done < <(jq -r '.[]' <<<"$names")
     echo "Set: $(basename "$0") primary <name|number>   Clear: $(basename "$0") primary off"
     return
   fi
 
-  if [[ "$arg" == "off" ]]; then
-    target=""
-  elif [[ "$arg" =~ ^[0-9]+$ ]]; then
-    target="$(sed -n "${arg}p" <<<"$tags")"
-    [[ -n "$target" ]] || die "No server number $arg"
-  else
-    grep -qxF -- "$arg" <<<"$tags" || die "No such server: $arg (list: $(basename "$0") primary)"
-    target="$arg"
+  if [[ "$arg" != "off" ]]; then
+    names="$(subscription_names "$ST_URL")"
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+      target="$(jq -r --argjson i "$arg" '.[$i - 1] // empty' <<<"$names")"
+      [[ -n "$target" ]] || die "No server number $arg"
+    else
+      jq -e --arg a "$arg" 'index($a)' <<<"$names" >/dev/null || die "No such server: $arg (list: $(basename "$0") primary)"
+      target="$arg"
+    fi
   fi
 
-  tmp="$(mktemp)"
-  run_root jq --arg p "$target" '.primary = $p' "$SUBSCRIPTION_STATE_FILE" > "$tmp"
-  run_root install -m 0600 "$tmp" "$SUBSCRIPTION_STATE_FILE"
-  rm -f "$tmp"
-  watch_save 0 0 false false
+  ST_PRIMARY="$target"
+  save_state
+  build_mihomo_config | apply_config
   if [[ -n "$target" ]]; then log "Priority server: $target"; else log "Priority server cleared"; fi
-  # Rewrites the selector default on disk (no restart needed for that alone)...
-  subscribe_vpn
-  # ...and switches the running selector right away.
-  [[ -z "$target" ]] || switch_to "$target" "set as priority"
 }
 
 cmd_rules_edit() {
@@ -1801,26 +1302,8 @@ cmd_rules_import() {
 
 cmd_rules_apply() {
   ensure_cmd jq
-  run_root test -f "$CONFIG_FILE" || die "Configure the VPN first: $(basename "$0") configure or subscribe <url>"
-
-  local custom_rules_json custom_dns_rules_json tmp
-  custom_rules_json="$(compile_custom_rules)"
-  custom_dns_rules_json="$(compile_custom_dns_rules)"
-  tmp="$(mktemp)"
-
-  run_root jq --argjson custom "$custom_rules_json" --argjson custom_dns "$custom_dns_rules_json" '
-    .route.rules = ([{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}] + $custom)
-    | .dns.rules = $custom_dns
-    | if (.dns.servers | any(.tag == "local")) then . else .dns.servers += [{type: "local", tag: "local"}] end
-  ' "$CONFIG_FILE" > "$tmp" || die "Could not apply rules to the current config"
-
-  run_root install -m 0600 "$tmp" "$CONFIG_FILE"
-  rm -f "$tmp"
-
-  run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE" \
-    || die "New config failed sing-box validation, restore from a .backup-*.json"
-  restart_service
-  log "Rules applied and sing-box restarted"
+  rebuild_and_apply
+  log "Rules applied"
 }
 
 detect_public_ip() {
@@ -1839,27 +1322,9 @@ detect_public_ip() {
 }
 
 show_status_summary() {
-  local current_ip mode include_uids users dashboard_enabled clash_api_bind
-
+  local current_ip users
   current_ip="$(detect_public_ip)"
-  mode="unknown"
-  users=""
-  dashboard_enabled="false"
-  clash_api_bind="$CLASH_API_BIND"
-
-  if run_root test -f "$SUBSCRIPTION_STATE_FILE"; then
-    mode="subscription"
-    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$SUBSCRIPTION_STATE_FILE")"
-    clash_api_bind="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$SUBSCRIPTION_STATE_FILE")"
-  elif run_root test -f "$STATE_FILE"; then
-    mode="$(run_root jq -r '.user_scope // "unknown"' "$STATE_FILE")"
-    include_uids="$(run_root jq -c '.include_uids // []' "$STATE_FILE")"
-    if [[ "$include_uids" != "[]" ]]; then
-      users="$(run_root jq -r '.include_uids | map(tostring) | join(", ")' "$STATE_FILE")"
-    fi
-    dashboard_enabled="$(run_root jq -r '.dashboard_enabled // false' "$STATE_FILE")"
-    clash_api_bind="$(run_root jq -r --arg d "$CLASH_API_BIND" '.clash_api_bind // $d' "$STATE_FILE")"
-  fi
+  load_state
 
   echo
   echo "VPN summary:"
@@ -1868,34 +1333,37 @@ show_status_summary() {
   else
     echo "  Public IP: unavailable"
   fi
-  echo "  Mode: $mode"
-  if [[ -n "$users" ]]; then
-    echo "  Routed UIDs: $users"
+  if ! run_root test -f "$STATE_FILE"; then
+    echo "  Mode: not configured ($(basename "$0") configure)"
+    return
   fi
+  echo "  Engine: mihomo"
+  if [[ "$ST_MODE" == "subscription" ]]; then
+    echo "  Mode: subscription (refreshed by mihomo every ${SUBSCRIPTION_REFRESH_SEC}s)"
+    echo "  Subscription URL: $ST_URL"
+    echo "  Priority server: ${ST_PRIMARY:-none} (set: $(basename "$0") primary)"
+    show_api_summary
+  else
+    echo "  Mode: $ST_SCOPE"
+    users="$(jq -r 'map(tostring) | join(", ")' <<<"$ST_UIDS")"
+    [[ -z "$users" ]] || echo "  Routed UIDs: $users"
+  fi
+  if [[ "$ST_DASH" == "true" ]]; then
+    echo "  Dashboard: http://${ST_BIND}/ui/"
+  else
+    echo "  Dashboard: disabled (enable via: $(basename "$0") reconfigure)"
+  fi
+}
 
-  if [[ "$mode" == "subscription" ]] && run_root test -f "$SUBSCRIPTION_STATE_FILE"; then
-    echo "  Subscription URL: $(run_root jq -r '.url' "$SUBSCRIPTION_STATE_FILE")"
-    echo "  Servers: $(run_root jq -r '.proxy_count' "$SUBSCRIPTION_STATE_FILE")"
-    echo "  Last fetched: $(run_root jq -r '.fetched_at' "$SUBSCRIPTION_STATE_FILE")"
-    echo "  Auto-refresh: $(os_subscription_timer_status)"
-    if run_root test -f "$RUNNING_FILE" && ! run_root cmp -s "$CONFIG_FILE" "$RUNNING_FILE"; then
-      echo "  Config on disk is newer than the running one (applies at next restart: $(basename "$0") restart)"
-    fi
-    local primary
-    primary="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
-    echo "  Priority server: ${primary:-none} (set: $(basename "$0") primary)"
-    if [[ -n "$primary" ]]; then
-      echo "  Failover active: $(watch_get failover false), priority fail/ok ticks: $(watch_get fail 0)/$(watch_get ok 0)"
-    fi
-  fi
-
-  if [[ "$mode" != "unknown" ]]; then
-    if [[ "$dashboard_enabled" == "true" ]]; then
-      echo "  Dashboard: http://${clash_api_bind}/ui/"
-    else
-      echo "  Dashboard: disabled (enable via: $(basename "$0") reconfigure)"
-    fi
-  fi
+# Live view from mihomo's API: servers in the pool and what the groups point at now.
+show_api_summary() {
+  local g now
+  api_call GET /providers/proxies/sub >/dev/null 2>&1 || { echo "  mihomo API: unreachable"; return; }
+  echo "  Servers: $(api_call GET /providers/proxies/sub | jq '.proxies | length')"
+  for g in PROXY FAILOVER PRIMARY BACKUP AUTO; do
+    now="$(api_call GET "/proxies/${g}" 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || continue
+    [[ -z "$now" ]] || echo "  ${g} -> ${now}"
+  done
 }
 
 usage() {
@@ -1904,78 +1372,68 @@ usage() {
   cat <<HELP_EOF
 Usage: ${cmd} <command>
 
+Engine: mihomo (Clash.Meta). Config: $CONFIG_FILE.
+
 Commands:
   configure          Interactive setup: single server (vless:// / ss:// / JSON) or a
                      subscription (multiple servers). Also asks about the direct-vs-VPN
-                     rules file (skip / a well-known local path / a URL / a file path)
-                     and whether to enable the web dashboard.
+                     rules file (skip / a well-known local path / a URL / a file path),
+                     an optional priority server (subscription) and whether to enable
+                     the web dashboard.
   reconfigure        Same as configure
-  subscribe [url]    Fetch/refresh a subscription non-interactively, reusing the
-                     dashboard on/off choice saved from configure. With no prior
-                     subscription on file, asks once whether to enable the dashboard.
-                     Also (re)installs the background auto-refresh timer (see below).
+  subscribe [url]    With a URL: switch to that subscription (reuses the saved dashboard
+                     choice). Without: refresh the saved subscription right now.
   primary [name|n|off]  Advanced: priority server for a subscription. Shows the list
                      without arguments. See "Priority server" below.
   rules edit         Edit the direct-vs-VPN rules file (\$EDITOR, default nano)
   rules import <path|url>   Replace the rules file from a {"rules": [...]} JSON
   rules list         Show rule groups and their on/off state
   rules toggle <name> on|off   Flip a rule group without opening the editor
-  rules apply        Recompile rules into sing-box and restart the service
+  rules apply        Recompile rules into the mihomo config and re-read it (no restart)
   status             Show service status
   start              Start VPN service
   stop               Stop VPN service
   restart            Restart VPN service
   enable             Enable autostart on boot
   disable            Disable autostart on boot
-  uninstall          Completely remove sing-box and all configurations
-  logs               Follow sing-box logs
-  show-config        Print /etc/sing-box/config.json
-  show-state         Print /etc/sing-box/vpnc-state.json
+  uninstall          Completely remove mihomo and all configurations
+  logs               Follow mihomo logs
+  show-config        Print $CONFIG_FILE
+  show-state         Print $STATE_FILE
   help               Show this help
 
 Web dashboard:
-  The Clash-style dashboard (server list, ping/speed test, manual pick or
-  "auto"-fastest) is off by default and only turns on if you answer "yes" to
-  "Enable web dashboard?" during configure/subscribe — you're then also asked for the
-  bind address (IP:port), with VPNC_CLASH_API_BIND / CLASH_API_BIND's built-in default
-  (see the top of this script) offered as a suggestion. Once enabled it's served at
-  http://<bind>/ui/.
+  metacubexd (server list, ping, manual pick) is off by default and only turns on if you
+  answer "yes" to "Enable web dashboard?" during configure/subscribe; you are then asked
+  for the bind address (IP:port), VPNC_CLASH_API_BIND / the built-in default is offered.
+  It is local and has no secret. Once enabled: http://<bind>/ui/.
 
 Direct-vs-VPN rules:
-  \$RULES_FILE ($RULES_FILE) starts out empty — nothing bypasses the VPN until you add
-  rule groups yourself (${cmd} rules edit/toggle). To seed it from a JSON file instead,
+  \$RULES_FILE ($RULES_FILE) starts out empty unless seeded. To seed it from a JSON file,
   set VPNC_RULES_SEED_PATH=<local path> or VPNC_RULES_SEED_URL=<url> (format:
-  {"rules": [...]}) before the first "rules" command runs; leave both unset to skip
-  seeding entirely.
+  {"rules": [...]}) before the first "rules" command runs.
 
-Subscription auto-refresh:
-  Once a subscription is active (configure's option 3, or "subscribe"), it is
-  re-downloaded every ${SUBSCRIPTION_REFRESH_SEC}s in the background (systemd timer on
-  Linux, launchd on macOS) so server changes on the provider's side show up without you
-  running "subscribe" by hand. sing-box is only restarted (dropping active connections)
-  when the refreshed server list actually differs from what's running — an unchanged
-  refresh is a no-op. Override the interval with VPNC_SUBSCRIPTION_REFRESH_SEC (seconds)
-  before running configure/subscribe. Switching back to single-server mode removes the
-  timer automatically.
+Subscription:
+  mihomo downloads the subscription itself (proxy-providers) every
+  ${SUBSCRIPTION_REFRESH_SEC}s (VPNC_SUBSCRIPTION_REFRESH_SEC before configure/subscribe),
+  health-checks every server and updates their definitions in place; there is no
+  vpnc timer and nothing restarts. Torrent/whitelist-CDN nodes are filtered out.
 
 Priority server (advanced, subscription mode):
-  "${cmd} primary <name|number>" pins one server: the connection goes through it. A
-  background tick (every ${WATCH_INTERVAL_SEC}s, VPNC_WATCH_SEC) pings servers via sing-box's clash_api.
-  If the priority server stops answering, the subscription is refreshed once to pick up
-  an updated config of that location; if it still fails, traffic moves to the fastest
-  live server and returns to the priority one as soon as it answers again. "primary off"
-  clears it. Without a priority server the tick only refreshes the subscription.
+  "${cmd} primary <name|number>" pins one server. A fallback group keeps traffic on it, moves
+  to the fastest other server when it stops answering and returns as soon as it answers
+  again. If the server disappears from the subscription, traffic goes to the others.
+  "primary off" clears it.
 HELP_EOF
 }
 
 uninstall_vpn() {
   ensure_runtime_dependencies
-  echo "[WARN] This will completely remove sing-box and all its configurations!"
+  echo "[WARN] This will completely remove mihomo and all its configurations!"
   echo "[WARN] The following will be deleted:"
-  echo "  - /usr/local/bin/sing-box"
-  echo "  - /etc/sing-box/"
+  echo "  - $MIHOMO_BIN"
+  echo "  - /etc/mihomo/"
   echo "  - $(os_service_file)"
-  echo "  - subscription refresh timer (if a subscription is active)"
   echo "  - /usr/local/bin/vpnc"
   echo "  - /usr/local/bin/makrelbka-vpnc"
   echo "  - /usr/local/lib/vpnc/"
@@ -1987,13 +1445,9 @@ uninstall_vpn() {
     return
   fi
 
-  echo "Stopping and disabling sing-box service..."
+  echo "Stopping and disabling mihomo service..."
   os_service_stop 2>/dev/null || true
   os_service_disable 2>/dev/null || true
-
-  echo "Stopping subscription refresh timer..."
-  os_subscription_timer_disable 2>/dev/null || true
-  os_subscription_timer_remove 2>/dev/null || true
 
   echo "Clearing routing runtime rules..."
   clear_selected_routing
@@ -2003,8 +1457,8 @@ uninstall_vpn() {
   os_service_remove
   os_service_reload
 
-  echo "Removing sing-box binary..."
-  run_root rm -f /usr/local/bin/sing-box
+  echo "Removing mihomo binary..."
+  run_root rm -f "$MIHOMO_BIN"
 
   if run_root test -f "$RULES_FILE"; then
     local user_backup
@@ -2021,12 +1475,12 @@ uninstall_vpn() {
   fi
 
   echo "Removing configuration directory..."
-  run_root rm -rf /etc/sing-box
+  run_root rm -rf /etc/mihomo
 
   echo "Removing manager script..."
   run_root rm -f /usr/local/bin/vpnc /usr/local/bin/makrelbka-vpnc
   run_root rm -rf /usr/local/lib/vpnc
 
-  echo "[SUCCESS] sing-box has been completely uninstalled."
+  echo "[SUCCESS] mihomo has been completely uninstalled."
   echo "You may want to reboot your system to clean up any remaining TUN interfaces."
 }

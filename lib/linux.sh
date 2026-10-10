@@ -2,16 +2,16 @@
 # Linux layer for vpnc: package managers, systemd service, nftables/ip-rule
 # selected-users routing. Implements the os_* interface used by lib/common.sh.
 
-OS_NAME_RELEASE="linux"          # asset name in sing-box releases
+OS_NAME_RELEASE="linux"          # asset name in mihomo releases
 OS_DEFAULT_CLASH_BIND="192.168.77.2:9090"   # the Wi-Fi hotspot's own address (wlan0-ap.service)
-OS_AUTO_REDIRECT="true"          # sing-box auto_redirect is Linux-only (needs nftables)
+OS_AUTO_REDIRECT="true"          # mihomo tun auto-redirect is Linux-only (needs nftables)
 OS_TUN_INTERFACE="sbtun"
 
-SERVICE_FILE="/etc/systemd/system/sing-box.service"
-SUBSCRIPTION_TIMER_UNIT="vpnc-subscription.timer"
-SUBSCRIPTION_SERVICE_UNIT="vpnc-subscription.service"
-SUBSCRIPTION_TIMER_FILE="/etc/systemd/system/${SUBSCRIPTION_TIMER_UNIT}"
-SUBSCRIPTION_SERVICE_FILE="/etc/systemd/system/${SUBSCRIPTION_SERVICE_UNIT}"
+SERVICE_FILE="/etc/systemd/system/mihomo.service"
+# Left behind by the sing-box version of vpnc (see os_migrate_from_singbox).
+OLD_SERVICE_FILE="/etc/systemd/system/sing-box.service"
+OLD_TIMER_UNIT="vpnc-subscription.timer"
+OLD_TIMER_SERVICE_UNIT="vpnc-subscription.service"
 
 os_service_file() {
   echo "$SERVICE_FILE"
@@ -91,46 +91,43 @@ wait_for_interface() {
 }
 
 write_service_file() {
-  if [[ -n "$SUDO" ]]; then
-    $SUDO tee "$SERVICE_FILE" >/dev/null <<'UNIT_EOF'
+  local tmp_unit
+  tmp_unit="$(mktemp)"
+  cat > "$tmp_unit" <<UNIT_EOF
 [Unit]
-Description=sing-box
+Description=mihomo
 After=network-online.target wlan0-ap.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecStart=${MIHOMO_BIN} -d ${CONFIG_DIR}
 ExecStartPost=/usr/local/bin/vpnc _apply-selected-routing
 ExecStopPost=-/usr/local/bin/vpnc _clear-selected-routing
 Restart=always
 RestartSec=3
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
 UNIT_EOF
-  else
-    cat > "$SERVICE_FILE" <<'UNIT_EOF'
-[Unit]
-Description=sing-box
-After=network-online.target wlan0-ap.service
-Wants=network-online.target
+  run_root install -m 0644 "$tmp_unit" "$SERVICE_FILE"
+  rm -f "$tmp_unit"
+}
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-ExecStartPost=/usr/local/bin/vpnc _apply-selected-routing
-ExecStopPost=-/usr/local/bin/vpnc _clear-selected-routing
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-UNIT_EOF
-  fi
+# The sing-box version of vpnc ran its own TUN and a refresh timer; both would fight the
+# new service, so they are stopped and removed (the /etc/sing-box files stay untouched).
+os_migrate_from_singbox() {
+  run_root systemctl disable --now sing-box.service 2>/dev/null || true
+  run_root systemctl disable --now "$OLD_TIMER_UNIT" 2>/dev/null || true
+  run_root rm -f "$OLD_SERVICE_FILE" "/etc/systemd/system/${OLD_TIMER_UNIT}" "/etc/systemd/system/${OLD_TIMER_SERVICE_UNIT}"
+  run_root systemctl daemon-reload
 }
 
 os_service_write() {
+  os_migrate_from_singbox
   write_service_file
 }
 
@@ -139,107 +136,40 @@ os_service_reload() {
 }
 
 os_service_enable() {
-  run_root systemctl enable sing-box
+  run_root systemctl enable mihomo
 }
 
 os_service_disable() {
-  run_root systemctl disable sing-box
+  run_root systemctl disable mihomo
 }
 
 os_service_start() {
-  run_root systemctl start sing-box
+  run_root systemctl start mihomo
 }
 
 os_service_stop() {
-  run_root systemctl stop sing-box
+  run_root systemctl stop mihomo
 }
 
 os_service_restart() {
-  run_root systemctl restart sing-box
+  run_root systemctl restart mihomo
 }
 
 os_service_is_active() {
-  run_root systemctl is-active --quiet sing-box
+  run_root systemctl is-active --quiet mihomo
 }
 
 os_service_status() {
-  run_root systemctl status sing-box --no-pager
+  run_root systemctl status mihomo --no-pager
 }
 
 os_service_logs() {
-  run_root journalctl -u sing-box -f
+  run_root journalctl -u mihomo -f
 }
 
 os_service_remove() {
   run_root rm -f "$SERVICE_FILE"
-  run_root rm -rf /etc/systemd/system/sing-box.service.d
-}
-
-# --- subscription auto-refresh (systemd timer) ------------------------------
-
-os_subscription_timer_write() {
-  local interval_sec="$1"
-  local tmp_service tmp_timer
-
-  tmp_service="$(mktemp)"
-  cat > "$tmp_service" <<UNIT_EOF
-[Unit]
-Description=vpnc subscription refresh
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/vpnc _tick
-UNIT_EOF
-  run_root install -m 0644 "$tmp_service" "$SUBSCRIPTION_SERVICE_FILE"
-  rm -f "$tmp_service"
-
-  tmp_timer="$(mktemp)"
-  cat > "$tmp_timer" <<UNIT_EOF
-[Unit]
-Description=Periodic vpnc subscription refresh
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=${interval_sec}s
-Persistent=true
-Unit=${SUBSCRIPTION_SERVICE_UNIT}
-
-[Install]
-WantedBy=timers.target
-UNIT_EOF
-  run_root install -m 0644 "$tmp_timer" "$SUBSCRIPTION_TIMER_FILE"
-  rm -f "$tmp_timer"
-
-  if ! run_root test -f "$SUBSCRIPTION_SERVICE_FILE" || ! run_root test -f "$SUBSCRIPTION_TIMER_FILE"; then
-    die "Could not write subscription timer files (need root?)"
-  fi
-
-  run_root systemctl daemon-reload
-}
-
-os_subscription_timer_enable() {
-  run_root systemctl enable --now "$SUBSCRIPTION_TIMER_UNIT"
-}
-
-os_subscription_timer_disable() {
-  run_root systemctl disable --now "$SUBSCRIPTION_TIMER_UNIT" 2>/dev/null || true
-}
-
-os_subscription_timer_remove() {
-  run_root rm -f "$SUBSCRIPTION_TIMER_FILE" "$SUBSCRIPTION_SERVICE_FILE"
-  run_root systemctl daemon-reload
-}
-
-os_subscription_timer_status() {
-  if run_root systemctl is-active --quiet "$SUBSCRIPTION_TIMER_UNIT" 2>/dev/null; then
-    local next
-    next="$(run_root systemctl show "$SUBSCRIPTION_TIMER_UNIT" -p NextElapseUSecRealtime --value 2>/dev/null)"
-    echo "on, refresh every ${SUBSCRIPTION_REFRESH_SEC}s, tick every ${WATCH_INTERVAL_SEC}s (next: ${next:-unknown})"
-  else
-    echo "off"
-  fi
+  run_root rm -rf /etc/systemd/system/mihomo.service.d
 }
 
 delete_ip_rule_pref() {

@@ -63,9 +63,6 @@ main() {
     primary)
       cmd_primary "${2:-}"
       ;;
-    _tick)
-      cmd_tick
-      ;;
     status)
       ensure_runtime_dependencies
       os_service_status
@@ -81,7 +78,7 @@ main() {
       ;;
     restart)
       ensure_runtime_dependencies
-      restart_service
+      os_service_restart
       ;;
     enable)
       ensure_runtime_dependencies

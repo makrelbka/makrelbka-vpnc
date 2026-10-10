@@ -1,10 +1,10 @@
-# singbox-bootstrap
+# vpnc
 
-Interactive installer for `sing-box` with service management.
+Interactive installer and manager for [mihomo](https://github.com/MetaCubeX/mihomo) (Clash.Meta) with service management. (Branch `feat/mihomo`; the `main` branch still uses sing-box.)
 
 ## What it does
 
-- installs `sing-box` binary from official GitHub release;
+- installs the `mihomo` binary from the official GitHub release;
 - installs helper command `makrelbka-vpnc`;
 - installs helper alias `vpnc`;
 - checks required runtime tools and installs missing packages automatically when possible;
@@ -16,13 +16,13 @@ Interactive installer for `sing-box` with service management.
   - `VLESS`
   - `VLESS + REALITY`
 - asks whether to enable the optional web dashboard (Clash-compatible UI) and, if so, its bind address;
-- converts input into `/etc/sing-box/config.json`;
+- converts input into `/etc/mihomo/config.yaml`;
 - supports full-tunnel mode or selected-users mode via TUN + route rules (single-server mode only; subscriptions are always full-tunnel);
 - supports a separate direct-vs-VPN rules file (`vpnc rules ...`, starts empty, optionally seedable from a local/remote JSON file) for bypassing specific domains/IPs/processes/ports;
-- creates/updates `systemd` service `sing-box.service`;
+- creates/updates `systemd` service `mihomo.service` (launchd on macOS) and stops the old sing-box service and refresh timer if present;
 - enables service autostart and restarts it.
 
-Default installed `sing-box` version is `1.12.20`.
+Default installed `mihomo` version is `1.19.31` (`MIHOMO_VERSION` overrides, `latest` is allowed).
 
 ## Protocol support
 
@@ -139,7 +139,7 @@ there's also a standalone command:
 vpnc subscribe https://your-subscription-url
 ```
 
-Every entry becomes a sing-box outbound (reusing the same parser as `configure`), grouped
+mihomo downloads the subscription itself (`proxy-providers`) and exposes every entry as a server, grouped
 into:
 - a `selector` outbound (`proxy`) — manual pick, one server or `auto`
 - a `urltest` outbound (`auto`) — automatically follows the lowest-latency server
@@ -156,29 +156,28 @@ Subscription mode is always full-tunnel (selected-users UID mode is not combined
 
 ## Priority server and failover (advanced)
 
-In subscription mode a background tick (`vpnc _tick`, every 20 s, `VPNC_WATCH_SEC`) always
-re-fetches the subscription (every `VPNC_SUBSCRIPTION_REFRESH_SEC`, 300 s). Optionally pin one
-server as the priority config (`configure` asks after downloading the list; Enter = none), or later:
+mihomo re-downloads the subscription every `VPNC_SUBSCRIPTION_REFRESH_SEC` (300 s), health-checks
+every server and replaces changed server definitions in place — no restart, no dropped
+connections, and no vpnc timer. `vpnc subscribe` (no URL) refreshes it right now.
+
+Optionally pin one server as the priority config (`configure` asks after downloading the list;
+Enter = none), or later:
 
 ```bash
 vpnc primary            # list servers, show the current priority one
 vpnc primary <name|n>   # connect through it
-vpnc primary off        # back to the old behaviour (auto = lowest latency)
+vpnc primary off        # back to the default (AUTO = lowest latency)
 ```
 
-With a priority server the tick pings servers in the background (via sing-box's clash_api).
-If the priority server stops answering (2 ticks), the subscription is refreshed once to pick
-up an updated config of that location; if it still fails, traffic moves to the fastest live
-server, and returns to the priority one as soon as it answers again (2 ticks). Picking another
-server by hand while the priority one is alive is left alone. Without a priority server the
-tick only refreshes the subscription. clash_api is always on in subscription mode (loopback
-`127.0.0.1:9099` + random secret unless the dashboard is enabled); the web UI itself stays opt-in.
-After updating, run `vpnc subscribe` once to switch the old refresh job to the new tick.
+With a priority server a `fallback` group keeps traffic on it, moves to the fastest other server
+when it stops answering and returns as soon as it answers again. If that server disappears from
+the subscription, traffic goes to the others (never directly). Picking another server by hand in
+the dashboard is possible and is remembered.
 
 ## Web dashboard
 
-Both single-server and subscription configs can optionally turn on sing-box's built-in
-Clash-compatible dashboard (`experimental.clash_api` + `external_ui`, auto-downloading
+Both single-server and subscription configs can optionally turn on mihomo's
+Clash-compatible dashboard (`external-controller` + `external-ui`, auto-downloading
 [metacubexd](https://github.com/MetaCubeX/metacubexd)). It is **off by default** — `configure`
 / `reconfigure` / a first-time `subscribe <url>` always ask "Enable web dashboard?" and the
 dashboard is only wired into `config.json` if you answer yes. There is no way to end up with
@@ -210,7 +209,7 @@ A separate rules file controls which domains/processes/ports/IPs bypass the VPN
 vpnc rules edit             # opens $EDITOR (default: nano) on the rules JSON
 vpnc rules list              # show rule groups and on/off state
 vpnc rules toggle <name> on|off   # flip a group without opening the editor
-vpnc rules apply             # recompile into sing-box route.rules + restart
+vpnc rules apply             # recompile into the mihomo rules and re-read the config (no restart)
 ```
 
 Each rule group looks like:
@@ -228,8 +227,8 @@ Each rule group looks like:
 Supported condition fields: `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`,
 `ip_cidr`, `port`, `port_range`, `process_name`, `package_name`. `switch: false` disables a
 group without deleting it. `or: true` combines multiple condition fields in the same group
-with OR logic (sing-box's `logical` rule type); otherwise they combine with AND, matching
-sing-box's own default.
+with OR logic (separate mihomo rules); `or: false` combines them with AND (`AND,(…)`). `domain_keyword`
+and `domain_regex` work in routing but not in the system-DNS list for direct domains.
 
 The rules file ships **empty** — there is no built-in default rule set, so nothing bypasses
 the VPN until you add rule groups yourself. You can build it up interactively with
@@ -249,7 +248,7 @@ employer's/bank's domains and shouldn't be committed — point `VPNC_RULES_SEED_
 locally, or copy it to the target box, instead.
 
 Note: `process_name`/`port` conditions only match traffic that originates on the box
-running `sing-box` itself — for a router/hotspot setup they mostly matter for traffic from
+running `mihomo` itself — for a router/hotspot setup they mostly matter for traffic from
 the box itself, not from Wi-Fi clients. `domain_suffix`/`domain_keyword`/`ip_cidr`
 conditions work normally for all forwarded (hotspot client) traffic.
 

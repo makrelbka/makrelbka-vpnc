@@ -109,58 +109,37 @@ detect_arch() {
   esac
 }
 
-install_sing_box() {
-  local arch release_json tag version target_version asset_url tmp_dir bin_path
+# mihomo ships one gzipped binary per platform: mihomo-<os>-<arch>-v<version>.gz.
+# A pinned version needs no GitHub API call (60 requests/hour per IP without a token).
+install_mihomo() {
+  local arch version tag asset_url tmp_dir
 
   arch="$(detect_arch)"
+  case "$arch" in
+    amd64|arm64|armv7) ;;
+    *) die "No mihomo build for architecture: $arch" ;;
+  esac
   log "Detected platform: ${OS_NAME_RELEASE}-${arch}"
 
-  target_version="${SING_BOX_VERSION:-1.12.20}"
-
-  if [[ "$target_version" == "latest" ]]; then
-    release_json="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)" \
-      || die "Could not query the GitHub API (rate limit?). Set SING_BOX_VERSION to a fixed version instead."
-    tag="$(jq -r '.tag_name' <<<"$release_json")"
-    version="${tag#v}"
-
-    asset_url="$(jq -r --arg v "$version" --arg os "$OS_NAME_RELEASE" --arg arch "$arch" '
-      .assets[]
-      | select(.name == ("sing-box-" + $v + "-" + $os + "-" + $arch + ".tar.gz"))
-      | .browser_download_url
-    ' <<<"$release_json" | head -n1)"
-
-    if [[ -z "$asset_url" ]]; then
-      asset_url="$(jq -r --arg os "$OS_NAME_RELEASE" --arg arch "$arch" '
-        .assets[]
-        | select(.name | test($os + "-" + $arch + "\\.tar\\.gz$"))
-        | .browser_download_url
-      ' <<<"$release_json" | head -n1)"
-    fi
+  version="${MIHOMO_VERSION:-1.19.31}"
+  if [[ "$version" == "latest" ]]; then
+    tag="$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name')" \
+      || die "Could not query the GitHub API (rate limit?). Set MIHOMO_VERSION to a fixed version instead."
   else
-    # A pinned version needs no API call (the unauthenticated API is limited to
-    # 60 requests/hour per IP); the release asset URL is predictable.
-    tag="v${target_version}"
-    version="${target_version}"
-    asset_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${version}-${OS_NAME_RELEASE}-${arch}.tar.gz"
+    tag="v${version}"
   fi
-
-  [[ -n "$asset_url" ]] || die "Could not find release asset for ${OS_NAME_RELEASE}-${arch}"
+  asset_url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-${OS_NAME_RELEASE}-${arch}-${tag}.gz"
 
   tmp_dir="$(mktemp -d)"
-
-  log "Downloading sing-box $tag"
-  curl -fsSL "$asset_url" -o "$tmp_dir/sing-box.tar.gz" \
-    || die "Could not download $asset_url (check SING_BOX_VERSION and your connection)"
-
-  tar -xzf "$tmp_dir/sing-box.tar.gz" -C "$tmp_dir"
-  bin_path="$(find "$tmp_dir" -type f -name sing-box | head -n1)"
-  [[ -n "$bin_path" ]] || die "sing-box binary was not found in archive"
+  log "Downloading mihomo $tag"
+  curl -fsSL "$asset_url" -o "$tmp_dir/mihomo.gz" \
+    || die "Could not download $asset_url (check MIHOMO_VERSION and your connection)"
+  gunzip -f "$tmp_dir/mihomo.gz"
 
   run_root install -d -m 0755 /usr/local/bin
-  run_root install -m 0755 "$bin_path" /usr/local/bin/sing-box
-
+  run_root install -m 0755 "$tmp_dir/mihomo" /usr/local/bin/mihomo
   rm -rf "$tmp_dir"
-  log "Installed sing-box to /usr/local/bin/sing-box"
+  log "Installed mihomo to /usr/local/bin/mihomo"
 }
 
 install_manager() {
@@ -201,7 +180,7 @@ bootstrap() {
 
   ensure_sudo
   os_ensure_deps
-  install_sing_box
+  install_mihomo
   install_manager
 
   log "Bootstrap completed"

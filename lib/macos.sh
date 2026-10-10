@@ -3,21 +3,21 @@
 # Implements the os_* interface used by lib/common.sh.
 #
 # Not available on macOS (by design): "only selected users" mode (needs
-# nftables + ip rule) and sing-box auto_redirect (Linux-only). Use the
+# nftables + ip rule) and mihomo tun auto-redirect (Linux-only). Use the
 # process_name rules (`vpnc rules edit`) to route individual apps instead.
 
-OS_NAME_RELEASE="darwin"         # asset name in sing-box releases
+OS_NAME_RELEASE="darwin"         # asset name in mihomo releases
 OS_DEFAULT_CLASH_BIND="127.0.0.1:9090"
 OS_AUTO_REDIRECT="false"
-OS_TUN_INTERFACE=""              # macOS requires utunN; let sing-box pick one
+OS_TUN_INTERFACE=""              # macOS requires utunN; let mihomo pick one
 
-LAUNCHD_LABEL="com.makrelbka.vpnc.sing-box"
+LAUNCHD_LABEL="com.makrelbka.vpnc.mihomo"
 SERVICE_FILE="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
-SERVICE_LOG="/var/log/sing-box.log"
+SERVICE_LOG="/var/log/mihomo.log"
 
-SUBSCRIPTION_LAUNCHD_LABEL="com.makrelbka.vpnc.subscription-refresh"
-SUBSCRIPTION_SERVICE_FILE="/Library/LaunchDaemons/${SUBSCRIPTION_LAUNCHD_LABEL}.plist"
-SUBSCRIPTION_LOG="/var/log/vpnc-subscription.log"
+# Left behind by the sing-box version of vpnc (see os_migrate_from_singbox).
+OLD_LAUNCHD_LABEL="com.makrelbka.vpnc.sing-box"
+OLD_SUBSCRIPTION_LABEL="com.makrelbka.vpnc.subscription-refresh"
 
 os_service_file() {
   echo "$SERVICE_FILE"
@@ -82,10 +82,9 @@ write_service_file() {
   <string>${LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/sing-box</string>
-    <string>run</string>
-    <string>-c</string>
-    <string>${CONFIG_FILE}</string>
+    <string>${MIHOMO_BIN}</string>
+    <string>-d</string>
+    <string>${CONFIG_DIR}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -107,7 +106,19 @@ PLIST_EOF
   rm -f "$tmp_plist"
 }
 
+# The sing-box version of vpnc ran its own TUN and a refresh job; both would fight the
+# new daemon, so they are unloaded and removed (the /etc/sing-box files stay untouched).
+os_migrate_from_singbox() {
+  local label
+  for label in "$OLD_LAUNCHD_LABEL" "$OLD_SUBSCRIPTION_LABEL"; do
+    run_root launchctl bootout "system/${label}" 2>/dev/null || true
+    run_root rm -f "/Library/LaunchDaemons/${label}.plist"
+  done
+  run_root rm -f /var/log/sing-box.log /var/log/vpnc-subscription.log
+}
+
 os_service_write() {
+  os_migrate_from_singbox
   write_service_file
 }
 
@@ -116,7 +127,7 @@ _launchd_loaded() {
   run_root launchctl print "system/${label}" >/dev/null 2>&1
 }
 
-# `launchctl bootout` returns before the daemon has fully stopped (sing-box tears its TUN
+# `launchctl bootout` returns before the daemon has fully stopped (mihomo tears its TUN
 # down first), and a `bootstrap` issued in that window fails with "Input/output error"
 # (5), leaving the service unloaded. So: wait for the unload, then retry the bootstrap.
 _launchd_wait_unloaded() {
@@ -197,73 +208,6 @@ os_service_logs() {
 os_service_remove() {
   run_root launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
   run_root rm -f "$SERVICE_FILE" "$SERVICE_LOG"
-}
-
-# --- subscription auto-refresh (launchd StartInterval) ----------------------
-
-os_subscription_timer_write() {
-  local interval_sec="$1"
-  local tmp_plist
-  tmp_plist="$(mktemp)"
-
-  cat > "$tmp_plist" <<PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${SUBSCRIPTION_LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/vpnc</string>
-    <string>_tick</string>
-  </array>
-  <key>StartInterval</key>
-  <integer>${interval_sec}</integer>
-  <key>RunAtLoad</key>
-  <false/>
-  <key>StandardOutPath</key>
-  <string>${SUBSCRIPTION_LOG}</string>
-  <key>StandardErrorPath</key>
-  <string>${SUBSCRIPTION_LOG}</string>
-</dict>
-</plist>
-PLIST_EOF
-
-  run_root install -d -m 0755 "$(dirname "$SUBSCRIPTION_SERVICE_FILE")"
-  run_root install -m 0644 "$tmp_plist" "$SUBSCRIPTION_SERVICE_FILE"
-  run_root chown root:wheel "$SUBSCRIPTION_SERVICE_FILE"
-  rm -f "$tmp_plist"
-
-  if ! run_root test -f "$SUBSCRIPTION_SERVICE_FILE"; then
-    die "Could not write subscription timer plist to $SUBSCRIPTION_SERVICE_FILE (need root?)"
-  fi
-}
-
-os_subscription_timer_enable() {
-  if _launchd_loaded "$SUBSCRIPTION_LAUNCHD_LABEL"; then
-    run_root launchctl bootout "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
-    _launchd_wait_unloaded "$SUBSCRIPTION_LAUNCHD_LABEL" || true
-  fi
-  run_root launchctl enable "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
-  _launchd_bootstrap "$SUBSCRIPTION_SERVICE_FILE" "$SUBSCRIPTION_LAUNCHD_LABEL"
-}
-
-os_subscription_timer_disable() {
-  run_root launchctl bootout "system/${SUBSCRIPTION_LAUNCHD_LABEL}" 2>/dev/null || true
-}
-
-os_subscription_timer_remove() {
-  os_subscription_timer_disable
-  run_root rm -f "$SUBSCRIPTION_SERVICE_FILE" "$SUBSCRIPTION_LOG"
-}
-
-os_subscription_timer_status() {
-  if _launchd_loaded "$SUBSCRIPTION_LAUNCHD_LABEL"; then
-    echo "on, refresh every ${SUBSCRIPTION_REFRESH_SEC}s, tick every ${WATCH_INTERVAL_SEC}s"
-  else
-    echo "off"
-  fi
 }
 
 # Per-user routing is Linux-only: keep the shared code paths as no-ops.
