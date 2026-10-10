@@ -19,6 +19,18 @@ else
   VPNC_LIB_DIR="${VPNC_LIB_DIR:-/usr/local/lib/vpnc}"
 fi
 
+# Default the rules seed to the bundled template so a fresh install/reinstall doesn't
+# start with empty routing rules — only kicks in while $RULES_FILE doesn't exist yet
+# (see seed_rules_file_if_missing in common.sh) and only if the caller hasn't set
+# their own VPNC_RULES_SEED_PATH/URL.
+if [[ -z "${VPNC_RULES_SEED_PATH:-}" && -z "${VPNC_RULES_SEED_URL:-}" ]]; then
+  if [[ -f "$VPNC_LIB_DIR/vpnc-rules.default.json" ]]; then
+    export VPNC_RULES_SEED_PATH="$VPNC_LIB_DIR/vpnc-rules.default.json"
+  elif [[ -f "$VPNC_LIB_DIR/../vpnc-rules.local.json" ]]; then
+    export VPNC_RULES_SEED_PATH="$VPNC_LIB_DIR/../vpnc-rules.local.json"
+  fi
+fi
+
 # shellcheck source=../lib/common.sh
 source "$VPNC_LIB_DIR/common.sh"
 VPNC_OS="$(detect_os)"

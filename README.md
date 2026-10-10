@@ -236,3 +236,8 @@ conditions work normally for all forwarded (hotspot client) traffic.
 
 - The service waits for `sbtun` before applying selected-user routing, so the old `Cannot find device "sbtun"` startup race is handled.
 - On Debian / Ubuntu you usually do not need to install libraries or networking tools manually before running the installer.
+
+
+
+https://yandex.ru/profi/
+! dig +short yandex.ru ; dig +short yandex.ru @1.1.1.1 ; curl -sv -m 8 -o /dev/null https://yandex.ru/profi/ 2>&1 | grep -E 'Connected|SSL|HTTP|timed|resolve'

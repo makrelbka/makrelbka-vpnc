@@ -1,1 +1,5 @@
 vpnc-rules.local.json
+clash/subscription.url
+clash/config.yaml
+clash/providers/
+clash/sub.cache

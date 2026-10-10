@@ -234,6 +234,10 @@ PLIST_EOF
   run_root install -m 0644 "$tmp_plist" "$SUBSCRIPTION_SERVICE_FILE"
   run_root chown root:wheel "$SUBSCRIPTION_SERVICE_FILE"
   rm -f "$tmp_plist"
+
+  if ! run_root test -f "$SUBSCRIPTION_SERVICE_FILE"; then
+    die "Could not write subscription timer plist to $SUBSCRIPTION_SERVICE_FILE (need root?)"
+  fi
 }
 
 os_subscription_timer_enable() {

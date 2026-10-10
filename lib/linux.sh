@@ -212,6 +212,10 @@ UNIT_EOF
   run_root install -m 0644 "$tmp_timer" "$SUBSCRIPTION_TIMER_FILE"
   rm -f "$tmp_timer"
 
+  if ! run_root test -f "$SUBSCRIPTION_SERVICE_FILE" || ! run_root test -f "$SUBSCRIPTION_TIMER_FILE"; then
+    die "Could not write subscription timer files (need root?)"
+  fi
+
   run_root systemctl daemon-reload
 }
 

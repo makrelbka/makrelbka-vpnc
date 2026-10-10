@@ -847,11 +847,13 @@ configure_vpn() {
 
   local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme dashboard_enabled sub_url
 
-  # Asked once here (never during the unattended `subscribe` background refresh) so it
-  # covers both the single-server and subscription paths below.
-  select_rules_source
-
   input_type="$(select_input_type)"
+
+  # Asked once here (never during the unattended `subscribe` background refresh) so it
+  # covers both the single-server and subscription paths below. Runs after the mode
+  # choice above so the first question on a fresh setup is "what am I connecting to",
+  # not "how should routing rules work".
+  select_rules_source
 
   if [[ "$input_type" == "subscription" ]]; then
     ensure_cmd curl base64
@@ -963,7 +965,7 @@ decode_subscription_text() {
 
 fetch_subscription_url() {
   local url="$1" raw
-  raw="$(curl -fsSL --max-time 20 "$url")" || die "Could not download subscription: $url"
+  raw="$(curl -fsSL --compressed --max-time 20 "$url")" || die "Could not download subscription: $url"
   decode_subscription_text "$raw"
 }
 
@@ -1028,7 +1030,7 @@ seed_rules_file_if_missing() {
     cp "$RULES_SEED_PATH" "$tmp"
     source_desc="$RULES_SEED_PATH"
   elif [[ -n "$RULES_SEED_URL" ]]; then
-    curl -fsSL --max-time 20 "$RULES_SEED_URL" -o "$tmp" || die "Could not download rules seed: $RULES_SEED_URL"
+    curl -fsSL --compressed --max-time 20 "$RULES_SEED_URL" -o "$tmp" || die "Could not download rules seed: $RULES_SEED_URL"
     source_desc="$RULES_SEED_URL"
   else
     printf '%s\n' '{"rules": []}' > "$tmp"
@@ -1266,11 +1268,26 @@ configure_subscription() {
     log "Subscription unchanged ($server_count servers) — kept the running connection"
   fi
 
-  os_subscription_timer_write "$SUBSCRIPTION_REFRESH_SEC"
-  os_subscription_timer_enable
+  # Skip when already on: this same function runs every time the background timer
+  # fires `vpnc subscribe` on itself, and os_subscription_timer_enable() bootouts +
+  # reloads the launchd/systemd job — doing that from inside the job's own running
+  # instance is a self-unload race that can leave the timer not reloaded. Only
+  # (re)provision when it's actually missing (first run, or after `configure` switched
+  # back from single-server mode).
+  if [[ "$(os_subscription_timer_status)" == "off" ]]; then
+    os_subscription_timer_write "$SUBSCRIPTION_REFRESH_SEC"
+    os_subscription_timer_enable
+  fi
 
   if os_service_is_active; then
-    log "Subscription applied ($server_count servers). Background refresh every ${SUBSCRIPTION_REFRESH_SEC}s."
+    local timer_status
+    timer_status="$(os_subscription_timer_status)"
+    if [[ "$timer_status" == "off" ]]; then
+      warn "Background refresh timer is NOT enabled — subscription will not auto-update."
+      warn "To fix: run with sudo, e.g.  sudo $(basename "$0") subscribe"
+    else
+      log "Subscription applied ($server_count servers). Background refresh $timer_status."
+    fi
     if [[ "$dashboard_enabled" == "true" ]]; then
       echo "[INFO] Dashboard: http://${CLASH_API_BIND}/ui/ (reachable only from ${CLASH_API_BIND%%:*})"
     else
@@ -1358,7 +1375,7 @@ cmd_rules_import() {
   tmp="$(mktemp)"
   case "$src" in
     http://*|https://*)
-      curl -fsSL --max-time 20 "$src" -o "$tmp" || die "Could not download rules: $src"
+      curl -fsSL --compressed --max-time 20 "$src" -o "$tmp" || die "Could not download rules: $src"
       ;;
     *)
       [[ -f "$src" ]] || die "File does not exist: $src"
@@ -1569,6 +1586,20 @@ uninstall_vpn() {
 
   echo "Removing sing-box binary..."
   run_root rm -f /usr/local/bin/sing-box
+
+  if run_root test -f "$RULES_FILE"; then
+    local user_backup
+    user_backup="$(default_rules_candidate_path)"
+    if [[ -f "$user_backup" ]]; then
+      cp "$user_backup" "${user_backup}.backup-$(date +%Y%m%d-%H%M%S)"
+    fi
+    run_root cp "$RULES_FILE" "$user_backup"
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+      run_root chown "$SUDO_USER" "$user_backup" 2>/dev/null || true
+    fi
+    echo "Saved your routing rules to $user_backup"
+    echo "  (next 'configure' will offer to reuse it automatically — option 2 in the rules prompt)"
+  fi
 
   echo "Removing configuration directory..."
   run_root rm -rf /etc/sing-box

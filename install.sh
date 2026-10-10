@@ -25,6 +25,9 @@ LIB_INSTALL_DIR="/usr/local/lib/vpnc"
 VPNC_REF="${VPNC_REF:-main}"
 VPNC_RAW_BASE="${VPNC_RAW_BASE:-https://raw.githubusercontent.com/makrelbka/makrelbka-vpnc/${VPNC_REF}}"
 VPNC_FILES=(lib/common.sh lib/linux.sh lib/macos.sh bin/vpnc)
+# Optional: default routing rules seed. Missing/failed download is not fatal —
+# install_manager() just skips seeding a default and rules start out empty.
+VPNC_OPTIONAL_FILES=(vpnc-rules.local.json)
 
 SRC_DIR=""
 TMP_SRC=""
@@ -64,6 +67,10 @@ stage_sources() {
     log "Downloading $f"
     curl -fsSL "${VPNC_RAW_BASE}/${f}" -o "$TMP_SRC/$f" \
       || die "Could not download ${VPNC_RAW_BASE}/${f}"
+  done
+  for f in "${VPNC_OPTIONAL_FILES[@]}"; do
+    curl -fsSL "${VPNC_RAW_BASE}/${f}" -o "$TMP_SRC/$f" 2>/dev/null \
+      || { log "Optional file $f not available, skipping default rules seed"; rm -f "$TMP_SRC/$f"; }
   done
   SRC_DIR="$TMP_SRC"
 }
@@ -167,6 +174,11 @@ install_manager() {
 
   run_root install -m 0755 "$SRC_DIR/bin/vpnc" "$MANAGER_PATH"
   run_root ln -sf "$MANAGER_PATH" "$LEGACY_MANAGER_PATH"
+
+  if [[ -f "$SRC_DIR/vpnc-rules.local.json" ]]; then
+    run_root install -m 0644 "$SRC_DIR/vpnc-rules.local.json" "$LIB_INSTALL_DIR/vpnc-rules.default.json"
+    log "Installed default routing rules seed to $LIB_INSTALL_DIR/vpnc-rules.default.json"
+  fi
 
   log "Installed manager commands: $MANAGER_PATH and $LEGACY_MANAGER_PATH (libs in $LIB_INSTALL_DIR)"
 }
