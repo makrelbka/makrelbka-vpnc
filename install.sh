@@ -27,7 +27,7 @@ VPNC_RAW_BASE="${VPNC_RAW_BASE:-https://raw.githubusercontent.com/makrelbka/makr
 VPNC_FILES=(lib/common.sh lib/linux.sh lib/macos.sh bin/vpnc)
 # Optional: default routing rules seed. Missing/failed download is not fatal —
 # install_manager() just skips seeding a default and rules start out empty.
-VPNC_OPTIONAL_FILES=(vpnc-rules.local.json)
+VPNC_OPTIONAL_FILES=(vpnc-rules.local.json menubar/VpncBar.swift)
 
 SRC_DIR=""
 TMP_SRC=""
@@ -62,7 +62,7 @@ stage_sources() {
   command -v curl >/dev/null 2>&1 || die "curl is required to download installer files"
 
   TMP_SRC="$(mktemp -d)"
-  mkdir -p "$TMP_SRC/lib" "$TMP_SRC/bin"
+  mkdir -p "$TMP_SRC/lib" "$TMP_SRC/bin" "$TMP_SRC/menubar"
   for f in "${VPNC_FILES[@]}"; do
     log "Downloading $f"
     curl -fsSL "${VPNC_RAW_BASE}/${f}" -o "$TMP_SRC/$f" \
@@ -147,7 +147,7 @@ install_manager() {
 
   run_root install -d -m 0755 /usr/local/bin "$LIB_INSTALL_DIR"
 
-  for f in common.sh linux.sh macos.sh; do
+  for f in common.sh guard.sh linux.sh macos.sh; do
     run_root install -m 0644 "$SRC_DIR/lib/$f" "$LIB_INSTALL_DIR/$f"
   done
 
@@ -157,6 +157,18 @@ install_manager() {
   if [[ -f "$SRC_DIR/vpnc-rules.local.json" ]]; then
     run_root install -m 0644 "$SRC_DIR/vpnc-rules.local.json" "$LIB_INSTALL_DIR/vpnc-rules.default.json"
     log "Installed default routing rules seed to $LIB_INSTALL_DIR/vpnc-rules.default.json"
+  fi
+
+  # macOS menu-bar icon: built here when the Command Line Tools (swiftc) are present.
+  if [[ "$(uname -s)" == "Darwin" && -f "$SRC_DIR/menubar/VpncBar.swift" ]]; then
+    if command -v swiftc >/dev/null 2>&1 \
+       && swiftc -O -o "$SRC_DIR/.VpncBar.build" "$SRC_DIR/menubar/VpncBar.swift" -framework Cocoa 2>/dev/null; then
+      run_root install -m 0755 "$SRC_DIR/.VpncBar.build" "$LIB_INSTALL_DIR/VpncBar"
+      rm -f "$SRC_DIR/.VpncBar.build"
+      log "Built the menu-bar icon (enable: vpnc menubar on)"
+    else
+      log "Skipped the menu-bar icon (needs swiftc from Xcode Command Line Tools)"
+    fi
   fi
 
   log "Installed manager commands: $MANAGER_PATH and $LEGACY_MANAGER_PATH (libs in $LIB_INSTALL_DIR)"

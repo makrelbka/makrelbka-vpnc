@@ -36,6 +36,8 @@ source "$VPNC_LIB_DIR/common.sh"
 VPNC_OS="$(detect_os)"
 # shellcheck source=../lib/linux.sh
 source "$VPNC_LIB_DIR/${VPNC_OS}.sh"
+# shellcheck source=../lib/guard.sh
+source "$VPNC_LIB_DIR/guard.sh"
 
 # Re-evaluate now that OS_DEFAULT_CLASH_BIND is known.
 CLASH_API_BIND="${VPNC_CLASH_API_BIND:-$OS_DEFAULT_CLASH_BIND}"
@@ -62,6 +64,39 @@ main() {
       ;;
     primary)
       cmd_primary "${2:-}"
+      ;;
+    config)
+      cmd_config "${2:-}"
+      ;;
+    servers|ls)
+      cmd_servers
+      ;;
+    ping)
+      cmd_ping "${2:-}"
+      ;;
+    use)
+      cmd_use "${2:-}"
+      ;;
+    mode)
+      cmd_mode "${2:-}"
+      ;;
+    conns)
+      cmd_conns
+      ;;
+    ip)
+      cmd_ip
+      ;;
+    speed)
+      cmd_speed "${2:-all}"
+      ;;
+    dashboard)
+      cmd_dashboard
+      ;;
+    refresh)
+      subscribe_vpn ""
+      ;;
+    menubar)
+      cmd_menubar "${2:-status}"
       ;;
     status)
       ensure_runtime_dependencies
@@ -102,6 +137,9 @@ main() {
     show-state)
       ensure_runtime_dependencies
       run_root cat "$STATE_FILE"
+      ;;
+    _guard)
+      guard_loop
       ;;
     _apply-selected-routing)
       apply_selected_routing_from_state

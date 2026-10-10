@@ -8,10 +8,10 @@ OS_AUTO_REDIRECT="true"          # mihomo tun auto-redirect is Linux-only (needs
 OS_TUN_INTERFACE="sbtun"
 
 SERVICE_FILE="/etc/systemd/system/mihomo.service"
-# Left behind by the sing-box version of vpnc (see os_migrate_from_singbox).
-OLD_SERVICE_FILE="/etc/systemd/system/sing-box.service"
-OLD_TIMER_UNIT="vpnc-subscription.timer"
-OLD_TIMER_SERVICE_UNIT="vpnc-subscription.service"
+GUARD_SERVICE_FILE="/etc/systemd/system/vpnc-guard.service"   # failover guard (lib/guard.sh)
+os_default_iface() {
+  ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
 
 os_service_file() {
   echo "$SERVICE_FILE"
@@ -115,19 +115,32 @@ WantedBy=multi-user.target
 UNIT_EOF
   run_root install -m 0644 "$tmp_unit" "$SERVICE_FILE"
   rm -f "$tmp_unit"
+  write_guard_service_file
 }
 
-# The sing-box version of vpnc ran its own TUN and a refresh timer; both would fight the
-# new service, so they are stopped and removed (the /etc/sing-box files stay untouched).
-os_migrate_from_singbox() {
-  run_root systemctl disable --now sing-box.service 2>/dev/null || true
-  run_root systemctl disable --now "$OLD_TIMER_UNIT" 2>/dev/null || true
-  run_root rm -f "$OLD_SERVICE_FILE" "/etc/systemd/system/${OLD_TIMER_UNIT}" "/etc/systemd/system/${OLD_TIMER_SERVICE_UNIT}"
-  run_root systemctl daemon-reload
+write_guard_service_file() {
+  local tmp_unit
+  tmp_unit="$(mktemp)"
+  cat > "$tmp_unit" <<UNIT_EOF
+[Unit]
+Description=vpnc failover guard
+After=mihomo.service
+Wants=mihomo.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vpnc _guard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+  run_root install -m 0644 "$tmp_unit" "$GUARD_SERVICE_FILE"
+  rm -f "$tmp_unit"
 }
 
 os_service_write() {
-  os_migrate_from_singbox
   write_service_file
 }
 
@@ -137,22 +150,27 @@ os_service_reload() {
 
 os_service_enable() {
   run_root systemctl enable mihomo
+  run_root systemctl enable vpnc-guard 2>/dev/null || true
 }
 
 os_service_disable() {
   run_root systemctl disable mihomo
+  run_root systemctl disable vpnc-guard 2>/dev/null || true
 }
 
 os_service_start() {
   run_root systemctl start mihomo
+  run_root systemctl start vpnc-guard 2>/dev/null || warn "Could not start vpnc-guard; priority server will not fail over"
 }
 
 os_service_stop() {
+  run_root systemctl stop vpnc-guard 2>/dev/null || true
   run_root systemctl stop mihomo
 }
 
 os_service_restart() {
   run_root systemctl restart mihomo
+  run_root systemctl restart vpnc-guard 2>/dev/null || warn "Could not restart vpnc-guard"
 }
 
 os_service_is_active() {
@@ -168,7 +186,8 @@ os_service_logs() {
 }
 
 os_service_remove() {
-  run_root rm -f "$SERVICE_FILE"
+  run_root systemctl stop vpnc-guard 2>/dev/null || true
+  run_root rm -f "$SERVICE_FILE" "$GUARD_SERVICE_FILE"
   run_root rm -rf /etc/systemd/system/mihomo.service.d
 }
 

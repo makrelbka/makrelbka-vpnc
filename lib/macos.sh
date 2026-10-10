@@ -9,15 +9,20 @@
 OS_NAME_RELEASE="darwin"         # asset name in mihomo releases
 OS_DEFAULT_CLASH_BIND="127.0.0.1:9090"
 OS_AUTO_REDIRECT="false"
+OS_CONTROL_FILE_GROUP="admin"     # control.json readable by admin users (the Mac owner)
 OS_TUN_INTERFACE=""              # macOS requires utunN; let mihomo pick one
 
 LAUNCHD_LABEL="com.makrelbka.vpnc.mihomo"
 SERVICE_FILE="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
 SERVICE_LOG="/var/log/mihomo.log"
+GUARD_LABEL="com.makrelbka.vpnc.guard"   # failover guard (lib/guard.sh), a second daemon next to mihomo
+GUARD_SERVICE_FILE="/Library/LaunchDaemons/${GUARD_LABEL}.plist"
+GUARD_LOG="/var/log/vpnc-guard.log"
 
-# Left behind by the sing-box version of vpnc (see os_migrate_from_singbox).
-OLD_LAUNCHD_LABEL="com.makrelbka.vpnc.sing-box"
-OLD_SUBSCRIPTION_LABEL="com.makrelbka.vpnc.subscription-refresh"
+# Physical interface of the default route (the TUN only adds split routes on top of it).
+os_default_iface() {
+  route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}'
+}
 
 os_service_file() {
   echo "$SERVICE_FILE"
@@ -104,21 +109,54 @@ PLIST_EOF
   run_root install -m 0644 "$tmp_plist" "$SERVICE_FILE"
   run_root chown root:wheel "$SERVICE_FILE"
   rm -f "$tmp_plist"
+  write_guard_service_file
 }
 
-# The sing-box version of vpnc ran its own TUN and a refresh job; both would fight the
-# new daemon, so they are unloaded and removed (the /etc/sing-box files stay untouched).
-os_migrate_from_singbox() {
-  local label
-  for label in "$OLD_LAUNCHD_LABEL" "$OLD_SUBSCRIPTION_LABEL"; do
-    run_root launchctl bootout "system/${label}" 2>/dev/null || true
-    run_root rm -f "/Library/LaunchDaemons/${label}.plist"
-  done
-  run_root rm -f /var/log/sing-box.log /var/log/vpnc-subscription.log
+write_guard_service_file() {
+  local tmp_plist
+  tmp_plist="$(mktemp)"
+  cat > "$tmp_plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${GUARD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/vpnc</string>
+    <string>_guard</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>${GUARD_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${GUARD_LOG}</string>
+</dict>
+</plist>
+PLIST_EOF
+  run_root install -m 0644 "$tmp_plist" "$GUARD_SERVICE_FILE"
+  run_root chown root:wheel "$GUARD_SERVICE_FILE"
+  rm -f "$tmp_plist"
+}
+
+# The guard never blocks the mihomo service commands: its failures are only warnings.
+guard_service_start() {
+  _launchd_loaded "$GUARD_LABEL" && return 0
+  run_root launchctl bootstrap system "$GUARD_SERVICE_FILE" 2>/dev/null \
+    || warn "Could not load the failover guard (${GUARD_LABEL}); priority server will not fail over"
+}
+
+guard_service_stop() {
+  run_root launchctl bootout "system/${GUARD_LABEL}" 2>/dev/null || true
 }
 
 os_service_write() {
-  os_migrate_from_singbox
   write_service_file
 }
 
@@ -164,10 +202,12 @@ os_service_reload() {
 
 os_service_enable() {
   run_root launchctl enable "system/${LAUNCHD_LABEL}"
+  run_root launchctl enable "system/${GUARD_LABEL}" 2>/dev/null || true
 }
 
 os_service_disable() {
   run_root launchctl disable "system/${LAUNCHD_LABEL}"
+  run_root launchctl disable "system/${GUARD_LABEL}" 2>/dev/null || true
 }
 
 os_service_start() {
@@ -176,10 +216,12 @@ os_service_start() {
   else
     _launchd_bootstrap "$SERVICE_FILE" "$LAUNCHD_LABEL"
   fi
+  guard_service_start
 }
 
 # On macOS "stop" unloads the daemon (KeepAlive would otherwise restart it).
 os_service_stop() {
+  guard_service_stop
   run_root launchctl bootout "system/${LAUNCHD_LABEL}"
 }
 
@@ -187,6 +229,8 @@ os_service_restart() {
   run_root launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
   _launchd_wait_unloaded "$LAUNCHD_LABEL" || warn "Service is slow to stop, trying to start it anyway"
   _launchd_bootstrap "$SERVICE_FILE" "$LAUNCHD_LABEL"
+  guard_service_stop   # reload the plist: it may have changed since the guard was loaded
+  guard_service_start
 }
 
 os_service_is_active() {
@@ -206,8 +250,9 @@ os_service_logs() {
 }
 
 os_service_remove() {
+  guard_service_stop
   run_root launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null || true
-  run_root rm -f "$SERVICE_FILE" "$SERVICE_LOG"
+  run_root rm -f "$SERVICE_FILE" "$SERVICE_LOG" "$GUARD_SERVICE_FILE" "$GUARD_LOG"
 }
 
 # Per-user routing is Linux-only: keep the shared code paths as no-ops.

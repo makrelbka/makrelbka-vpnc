@@ -38,6 +38,11 @@ PROVIDERS_DIR="${CONFIG_DIR}/providers"
 PROBE_URL="https://www.gstatic.com/generate_204"
 # Torrent-only / whitelist-CDN nodes of the provider, never wanted in the pool (same as clash/gen.py).
 SUB_EXCLUDE="Торрент|Белые списки"
+# vpnc speed: a big file through the VPN path, and a Russian one fetched on the physical interface.
+SPEED_URL_FOREIGN="${VPNC_SPEED_URL_FOREIGN:-https://speed.cloudflare.com/__down?bytes=25000000}"
+SPEED_URL_RU="${VPNC_SPEED_URL_RU:-https://mirror.yandex.ru/ubuntu/ls-lR.gz}"
+# Address/secret of the controller for tools that run without sudo (CLI, menu-bar icon).
+CONTROL_FILE="${CONFIG_DIR}/control.json"
 
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
@@ -775,6 +780,7 @@ save_state() {
   run_root install -d -m 0755 "$CONFIG_DIR"
   run_root install -m 0600 "$tmp" "$STATE_FILE"
   rm -f "$tmp"
+  write_control_file
 }
 
 # Address and secret of mihomo's external controller: the dashboard address without a
@@ -787,17 +793,39 @@ control_endpoint() {
   fi
 }
 
-# api_call METHOD PATH [JSON_BODY] — talks to the running mihomo.
+# api_call METHOD PATH [JSON_BODY] — talks to the running mihomo. The address and secret come
+# from control.json (readable without sudo); without it, from the state file.
 api_call() {
-  local method="$1" path="$2" body="${3:-}"
-  load_state
-  control_endpoint
-  if [[ -n "$body" ]]; then
-    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer ${CTL_SECRET}" \
-      -H 'Content-Type: application/json' -d "$body" "http://${CTL_BIND}${path}"
+  local method="$1" path="$2" body="${3:-}" bind secret
+  if [[ -r "$CONTROL_FILE" ]]; then
+    bind="$(jq -r '.bind' "$CONTROL_FILE")"; secret="$(jq -r '.secret // ""' "$CONTROL_FILE")"
   else
-    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer ${CTL_SECRET}" "http://${CTL_BIND}${path}"
+    load_state
+    control_endpoint
+    bind="$CTL_BIND"; secret="$CTL_SECRET"
   fi
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer ${secret}" \
+      -H 'Content-Type: application/json' -d "$body" "http://${bind}${path}"
+  else
+    curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer ${secret}" "http://${bind}${path}"
+  fi
+}
+
+# Writes control.json after every state save (macOS: group admin may read it, so the CLI
+# and the menu-bar icon work without sudo; Linux: root only).
+write_control_file() {
+  local tmp
+  control_endpoint
+  tmp="$(mktemp)"
+  jq -n --arg bind "$CTL_BIND" --arg secret "$CTL_SECRET" --argjson ui "$ST_DASH" \
+    '{bind: $bind, secret: $secret, ui: $ui}' > "$tmp"
+  if [[ -n "${OS_CONTROL_FILE_GROUP:-}" ]]; then
+    run_root install -m 0640 -g "$OS_CONTROL_FILE_GROUP" "$tmp" "$CONTROL_FILE"
+  else
+    run_root install -m 0600 "$tmp" "$CONTROL_FILE"
+  fi
+  rm -f "$tmp"
 }
 
 # ---------------------------------------------------------------------------
@@ -894,16 +922,18 @@ build_mihomo_config() {
     def esc: gsub("(?<c>[.^$|?*+()\\[\\]{}\\\\])"; "\\" + .c);
     def groups:
       if $mode == "subscription" then
-        ([{name: "AUTO", type: "url-test", use: ["sub"], url: $probe, interval: 180, tolerance: 50}]
+        ([{name: "AUTO", type: "url-test", use: ["sub"], url: $probe, interval: 180, tolerance: 50, lazy: true}]
          + (if $primary != "" then
-              # PRIMARY keeps REJECT as a member: with no node matching, an empty group would
-              # turn into DIRECT and look alive to the fallback group.
-              [{name: "PRIMARY", type: "url-test", proxies: ["REJECT"], use: ["sub"],
-                filter: ("^" + ($primary | esc) + "$"), url: $probe, interval: 20},
+              # PRIMARY keeps REJECT as its first member: it is the default pick, so traffic fails
+              # closed (not DIRECT) until the guard selects the priority server, and an empty
+              # group (no node matches) cannot turn into DIRECT. Nothing here is probed: the
+              # guard (lib/guard.sh) moves FAILOVER from real traffic, not from pings.
+              [{name: "PRIMARY", type: "select", proxies: ["REJECT"], use: ["sub"],
+                filter: ("^" + ($primary | esc) + "$")},
                {name: "BACKUP", type: "url-test", use: ["sub"],
                 "exclude-filter": ("^" + ($primary | esc) + "$|" + $exclude),
-                url: $probe, interval: 30, tolerance: 50},
-               {name: "FAILOVER", type: "fallback", proxies: ["PRIMARY", "BACKUP"], url: $probe, interval: 20}]
+                url: $probe, interval: 300, tolerance: 50, timeout: 8000, lazy: true},
+               {name: "FAILOVER", type: "select", proxies: ["PRIMARY", "BACKUP"]}]
             else [] end)
          + [{name: "PROXY", type: "select", use: ["sub"],
              proxies: ((if $primary != "" then ["FAILOVER", "AUTO"] else ["AUTO"] end) + ["DIRECT"])}])
@@ -1191,8 +1221,8 @@ subscribe_vpn() {
 }
 
 # `vpnc primary [name|number|off]` — show / set / clear the priority server (advanced).
-# mihomo's fallback group does the rest: stays on it, drops to the backup group when it
-# stops answering, returns as soon as it answers again.
+# The guard (lib/guard.sh) does the rest: stays on it, drops to the backup group when real
+# requests stop getting answers, returns after a hold time and a few good probes.
 cmd_primary() {
   local arg="${1:-}" names n=0 name target=""
   ensure_cmd jq curl
@@ -1201,7 +1231,7 @@ cmd_primary() {
     || die "Priority server needs a subscription: $(basename "$0") subscribe <url>"
 
   if [[ -z "$arg" ]]; then
-    names="$(subscription_names "$ST_URL")"
+    names="$(server_names)"
     echo "Priority server: ${ST_PRIMARY:-(none)}"
     while IFS= read -r name; do
       n=$((n + 1))
@@ -1212,20 +1242,285 @@ cmd_primary() {
   fi
 
   if [[ "$arg" != "off" ]]; then
-    names="$(subscription_names "$ST_URL")"
-    if [[ "$arg" =~ ^[0-9]+$ ]]; then
-      target="$(jq -r --argjson i "$arg" '.[$i - 1] // empty' <<<"$names")"
-      [[ -n "$target" ]] || die "No server number $arg"
-    else
-      jq -e --arg a "$arg" 'index($a)' <<<"$names" >/dev/null || die "No such server: $arg (list: $(basename "$0") primary)"
-      target="$arg"
-    fi
+    target="$(resolve_server "$arg")"
   fi
 
   ST_PRIMARY="$target"
   save_state
   build_mihomo_config | apply_config
   if [[ -n "$target" ]]; then log "Priority server: $target"; else log "Priority server cleared"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Terminal counterparts of what the web panel does: servers, ping, use, config, mode,
+# conns, ip, speed, dashboard. They read/switch through mihomo's API using control.json
+# (readable without sudo), so none of them needs a password.
+# ---------------------------------------------------------------------------
+
+uri_encode() {
+  jq -rn --arg v "$1" '$v | @uri'
+}
+
+# JSON array of server names: the live provider list, else the single server, else the
+# subscription itself (mihomo not running).
+server_names() {
+  local n
+  if n="$(api_call GET /providers/proxies/sub 2>/dev/null | jq -c '[.proxies[].name]' 2>/dev/null)" && [[ -n "$n" && "$n" != "[]" ]]; then
+    echo "$n"; return
+  fi
+  if api_call GET /proxies/SERVER >/dev/null 2>&1; then
+    echo '["SERVER"]'; return
+  fi
+  load_state
+  [[ -n "$ST_URL" ]] || die "mihomo is not reachable and no subscription is saved"
+  subscription_names "$ST_URL"
+}
+
+# resolve_server NAME|NUMBER -> server name (dies when there is no such server).
+resolve_server() {
+  local arg="$1" names target
+  names="$(server_names)"
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    target="$(jq -r --argjson i "$arg" '.[$i - 1] // empty' <<<"$names")"
+    [[ -n "$target" ]] || die "No server number $arg (list: $(basename "$0") servers)"
+  else
+    jq -e --arg a "$arg" 'index($a)' <<<"$names" >/dev/null || die "No such server: $arg (list: $(basename "$0") servers)"
+    target="$arg"
+  fi
+  printf '%s\n' "$target"
+}
+
+# active_chain — "PROXY → FAILOVER → PRIMARY → <server>": where traffic goes right now.
+active_chain() {
+  local node="PROXY" out="PROXY" i j next
+  for i in 1 2 3 4 5; do
+    j="$(api_call GET "/proxies/$(uri_encode "$node")" 2>/dev/null)" || break
+    next="$(jq -r '.now // empty' <<<"$j")"
+    [[ -n "$next" ]] || break
+    out="${out} → ${next}"
+    node="$next"
+  done
+  printf '%s\n' "$out"
+}
+
+# primary_name — the priority server from the live config ("" when none).
+primary_name() {
+  api_call GET /proxies/PRIMARY 2>/dev/null | jq -r '(.all // []) - ["REJECT"] | .[0] // ""' 2>/dev/null || true
+}
+
+cmd_servers() {
+  local list chain active primary
+  api_call GET /configs >/dev/null 2>&1 || die "mihomo API is unreachable; is the service running? ($(basename "$0") status)"
+  chain="$(active_chain)"; active="${chain##* → }"
+  primary="$(primary_name)"
+  list="$(api_call GET /providers/proxies/sub 2>/dev/null || true)"
+  if [[ -z "$list" ]]; then
+    list="$(api_call GET /proxies/SERVER | jq -c '{proxies: [.]}')"
+  fi
+  echo "Active: ${chain}"
+  jq -r --arg a "$active" --arg p "$primary" '
+    .proxies | to_entries[]
+    | [(.key + 1 | tostring),
+       ((if .value.name == $a then "*" else "" end) + (if .value.name == $p then "P" else "" end) | if . == "" then "." else . end),
+       ((.value.history // [] | last | .delay // 0) as $d | if $d > 0 then "\($d) ms" else "-" end),
+       .value.name] | @tsv' <<<"$list" | column -t -s "$(printf '\t')"
+  echo "(* active, P priority, . none; delays are from the last health check — fresh: $(basename "$0") ping)"
+}
+
+cmd_ping() {
+  local arg="${1:-}" name out names delay
+  api_call GET /configs >/dev/null 2>&1 || die "mihomo API is unreachable; is the service running? ($(basename "$0") status)"
+  if [[ -n "$arg" ]]; then
+    name="$(resolve_server "$arg")"
+    # Provider nodes are not top-level proxies: they are probed through the provider.
+    if [[ "$name" == "SERVER" ]]; then
+      out="$(api_call GET "/proxies/SERVER/delay?url=$(uri_encode "$PROBE_URL")&timeout=5000" 2>/dev/null || true)"
+    else
+      out="$(api_call GET "/providers/proxies/sub/$(uri_encode "$name")/healthcheck?url=$(uri_encode "$PROBE_URL")&timeout=5000" 2>/dev/null || true)"
+    fi
+    delay="$(jq -r '.delay // 0' <<<"${out:-null}" 2>/dev/null || echo 0)"
+    if (( delay > 0 )); then
+      echo "${delay} ms  $name"
+    else
+      echo "timeout  $name"; return 1
+    fi
+    return
+  fi
+  names="$(server_names)"
+  if api_call GET /proxies/AUTO >/dev/null 2>&1; then
+    out="$(api_call GET "/group/AUTO/delay?url=$(uri_encode "$PROBE_URL")&timeout=5000" 2>/dev/null || echo '{}')"
+  else
+    out='{}'
+  fi
+  jq -r --argjson names "$names" '
+    . as $d | [$names[] | {n: ., ms: ($d[.] // 0)}] | sort_by(if .ms > 0 then .ms else 999999 end)
+    | .[] | (if .ms > 0 then "\(.ms) ms" else "timeout" end) + "\t" + .n' <<<"$out" | column -t -s "$(printf '\t')"
+}
+
+cmd_use() {
+  local arg="${1:-}" names n=0 name choice target now
+  api_call GET /configs >/dev/null 2>&1 || die "mihomo API is unreachable; is the service running? ($(basename "$0") status)"
+  if [[ -z "$arg" ]]; then
+    names="$(server_names)"
+    echo "Now: $(active_chain)"
+    while IFS= read -r name; do n=$((n + 1)); printf '  %2d) %s\n' "$n" "$name"; done < <(jq -r '.[]' <<<"$names")
+    echo "   a) auto (lowest latency)   d) direct"
+    read -r -p "Enter number, a or d (Enter = cancel): " choice
+    [[ -n "$choice" ]] || return 0
+    arg="$choice"
+    [[ "$arg" == "a" ]] && arg="auto"
+    [[ "$arg" == "d" ]] && arg="direct"
+  fi
+  case "$arg" in
+    auto) target="AUTO" ;;
+    failover) target="FAILOVER" ;;
+    direct) target="DIRECT" ;;
+    *) target="$(resolve_server "$arg")" ;;
+  esac
+  api_call PUT /proxies/PROXY "$(jq -cn --arg n "$target" '{name: $n}')" >/dev/null \
+    || die "Could not select '$target' (is there such a group/server in this config?)"
+  now="$(api_call GET /proxies/PROXY | jq -r '.now // empty')"
+  [[ "$now" == "$target" ]] || die "Selection did not stick (PROXY -> ${now:-?})"
+  log "PROXY -> $target"
+}
+
+# `vpnc config [name|number|off]` — the priority server. Without an argument: pick from a list.
+cmd_config() {
+  local arg="${1:-}"
+  if [[ -n "$arg" ]]; then
+    cmd_primary "$arg"
+    return
+  fi
+  ensure_cmd jq curl
+  load_state
+  [[ "$ST_MODE" == "subscription" && -n "$ST_URL" ]] \
+    || die "Priority server needs a subscription: $(basename "$0") subscribe <url>"
+  SUBSCRIPTION_TAGS_JSON="$(server_names)"
+  SUB_PRIMARY="$ST_PRIMARY"
+  select_primary_server
+  if [[ "$SUB_PRIMARY" == "$ST_PRIMARY" ]]; then
+    log "Priority server unchanged: ${ST_PRIMARY:-none}"
+    return
+  fi
+  ST_PRIMARY="$SUB_PRIMARY"
+  save_state
+  build_mihomo_config | apply_config
+  log "Priority server: ${ST_PRIMARY:-none}"
+}
+
+cmd_mode() {
+  local arg="${1:-}"
+  api_call GET /configs >/dev/null 2>&1 || die "mihomo API is unreachable; is the service running? ($(basename "$0") status)"
+  if [[ -z "$arg" ]]; then
+    echo "Mode: $(api_call GET /configs | jq -r '.mode')"
+    return
+  fi
+  case "$arg" in rule|global|direct) ;; *) die "Usage: $(basename "$0") mode [rule|global|direct]" ;; esac
+  api_call PATCH /configs "$(jq -cn --arg m "$arg" '{mode: $m}')" >/dev/null || die "Could not change the mode"
+  log "Mode: $arg (until the next restart; the config file keeps 'rule')"
+}
+
+cmd_conns() {
+  local out
+  out="$(api_call GET /connections 2>/dev/null)" || die "mihomo API is unreachable; is the service running? ($(basename "$0") status)"
+  jq -r '(.connections // []) as $c | "Active connections: \($c | length)",
+    ($c | group_by(.chains[0]) | map({n: .[0].chains[0], c: length}) | sort_by(-.c) | .[0:10][] | "  \(.c)\t\(.n)")' <<<"$out" \
+    | column -t -s "$(printf '\t')"
+}
+
+cmd_ip() {
+  local info
+  info="$(curl -s -m 8 https://ipinfo.io/json)" || die "Could not reach ipinfo.io"
+  jq -r '"IP:      \(.ip)", "Country: \(.country)  \(.city // "")", "Network: \(.org // "")"' <<<"$info"
+  if api_call GET /configs >/dev/null 2>&1; then
+    echo "Via:     $(active_chain)"
+  fi
+}
+
+# speed_probe LABEL URL [INTERFACE] — one download of at most 10 s; prints the address that
+# path exits with, the average speed and the connect/first-byte times.
+speed_probe() {
+  local label="$1" url="$2" iface="${3:-}" info res code bps connect ttfb
+  local -a opt=()
+  [[ -z "$iface" ]] || opt=(--interface "$iface")
+  info="$(curl -s -m 8 "${opt[@]}" https://ipinfo.io/json 2>/dev/null | jq -r '"\(.ip) (\(.country))"' 2>/dev/null || true)"
+  res="$(curl -s -o /dev/null -m 10 "${opt[@]}" -w '%{http_code} %{speed_download} %{time_connect} %{time_starttransfer}' "$url" 2>/dev/null || true)"
+  read -r code bps connect ttfb <<<"${res:-0 0 0 0}"
+  if [[ "${code:-0}" != "200" ]]; then
+    printf '%-8s %-26s failed (HTTP %s)\n' "$label" "${info:-?}" "${code:-0}"
+    return 1
+  fi
+  awk -v l="$label" -v ip="${info:-?}" -v b="$bps" -v c="$connect" -v t="$ttfb" \
+    'BEGIN { printf "%-8s %-26s %6.1f MB/s (%5.0f Mbit/s)  connect %3.0f ms  first byte %3.0f ms\n", l, ip, b/1048576, b*8/1000000, c*1000, t*1000 }'
+}
+
+cmd_speed() {
+  local which="${1:-all}" iface rc=0
+  case "$which" in all|foreign|ru) ;; *) die "Usage: $(basename "$0") speed [foreign|ru]" ;; esac
+  if [[ "$which" != "ru" ]]; then
+    speed_probe "foreign" "$SPEED_URL_FOREIGN" || rc=1
+  fi
+  if [[ "$which" != "foreign" ]]; then
+    iface="$(os_default_iface)"
+    [[ -n "$iface" ]] || die "Could not determine the physical network interface"
+    speed_probe "ru" "$SPEED_URL_RU" "$iface" || rc=1
+  fi
+  return "$rc"
+}
+
+# `vpnc menubar on|off|status` — the status icon in the macOS menu bar (a user LaunchAgent,
+# so no sudo and nothing here touches the VPN service).
+MENUBAR_LABEL="com.makrelbka.vpnc.menubar"
+cmd_menubar() {
+  local action="${1:-status}" bin plist domain
+  [[ "$(uname -s)" == "Darwin" ]] || die "The menu-bar icon is macOS only"
+  [[ "${EUID}" -ne 0 ]] || die "Run without sudo: the icon belongs to your user session"
+  bin="${VPNC_LIB_DIR:-/usr/local/lib/vpnc}/VpncBar"
+  plist="${HOME}/Library/LaunchAgents/${MENUBAR_LABEL}.plist"
+  domain="gui/$(id -u)"
+  case "$action" in
+    on)
+      [[ -x "$bin" ]] || die "Icon binary not found: $bin (install with: sudo bash ./install.sh --no-configure; needs swiftc from Xcode Command Line Tools)"
+      mkdir -p "$(dirname "$plist")"
+      cat > "$plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${MENUBAR_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${bin}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+PLIST_EOF
+      launchctl bootout "${domain}/${MENUBAR_LABEL}" 2>/dev/null || true
+      launchctl bootstrap "$domain" "$plist" || die "Could not start the icon (launchctl bootstrap failed)"
+      log "Menu-bar icon is on (starts at login)"
+      ;;
+    off)
+      launchctl bootout "${domain}/${MENUBAR_LABEL}" 2>/dev/null || true
+      rm -f "$plist"
+      log "Menu-bar icon is off"
+      ;;
+    status)
+      if launchctl print "${domain}/${MENUBAR_LABEL}" >/dev/null 2>&1; then
+        echo "Menu-bar icon: on"
+      else
+        echo "Menu-bar icon: off ($(basename "$0") menubar on)"
+      fi
+      ;;
+    *) die "Usage: $(basename "$0") menubar [on|off|status]" ;;
+  esac
+}
+
+cmd_dashboard() {
+  local bind ui
+  [[ -r "$CONTROL_FILE" ]] || die "Not configured: $(basename "$0") configure"
+  bind="$(jq -r '.bind' "$CONTROL_FILE")"; ui="$(jq -r '.ui // false' "$CONTROL_FILE")"
+  [[ "$ui" == "true" ]] || die "Dashboard is disabled (enable via: $(basename "$0") reconfigure)"
+  echo "http://${bind}/ui/"
+  if command -v open >/dev/null 2>&1; then open "http://${bind}/ui/"; fi
 }
 
 cmd_rules_edit() {
@@ -1385,6 +1680,17 @@ Commands:
                      choice). Without: refresh the saved subscription right now.
   primary [name|n|off]  Advanced: priority server for a subscription. Shows the list
                      without arguments. See "Priority server" below.
+  servers            List servers with delay; * active, P priority
+  ping [name|n]      Fresh delay test: one server or all, sorted
+  use [name|n|auto|failover|direct]   Pick the server in use (like the panel); no argument = list
+  config [name|n|off]  Priority server; no argument = pick from a list ("primary" is the same)
+  mode [rule|global|direct]   Routing mode (until the next restart)
+  conns              Active connections, per server
+  ip                 Current public IP, country, and the path it goes through
+  speed [foreign|ru] Download speed through the VPN and directly (Russian address)
+  dashboard          Show / open the web panel address
+  refresh            Refresh the subscription now (same as: subscribe)
+  menubar [on|off|status]   macOS menu-bar icon: flag of the server in use, red when down
   rules edit         Edit the direct-vs-VPN rules file (\$EDITOR, default nano)
   rules import <path|url>   Replace the rules file from a {"rules": [...]} JSON
   rules list         Show rule groups and their on/off state
@@ -1420,9 +1726,9 @@ Subscription:
   vpnc timer and nothing restarts. Torrent/whitelist-CDN nodes are filtered out.
 
 Priority server (advanced, subscription mode):
-  "${cmd} primary <name|number>" pins one server. A fallback group keeps traffic on it, moves
-  to the fastest other server when it stops answering and returns as soon as it answers
-  again. If the server disappears from the subscription, traffic goes to the others.
+  "${cmd} primary <name|number>" pins one server. A guard service watches real traffic (not
+  pings): when requests through it get no answers it moves to the fastest other server,
+  and returns after 5 minutes once it answers again. If the server disappears from the subscription, traffic goes to the others.
   "primary off" clears it.
 HELP_EOF
 }
