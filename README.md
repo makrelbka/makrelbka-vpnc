@@ -154,6 +154,27 @@ vpnc subscribe
 
 Subscription mode is always full-tunnel (selected-users UID mode is not combined with it).
 
+## Priority server and failover (advanced)
+
+In subscription mode a background tick (`vpnc _tick`, every 20 s, `VPNC_WATCH_SEC`) always
+re-fetches the subscription (every `VPNC_SUBSCRIPTION_REFRESH_SEC`, 300 s). Optionally pin one
+server as the priority config (`configure` asks after downloading the list; Enter = none), or later:
+
+```bash
+vpnc primary            # list servers, show the current priority one
+vpnc primary <name|n>   # connect through it
+vpnc primary off        # back to the old behaviour (auto = lowest latency)
+```
+
+With a priority server the tick pings servers in the background (via sing-box's clash_api).
+If the priority server stops answering (2 ticks), the subscription is refreshed once to pick
+up an updated config of that location; if it still fails, traffic moves to the fastest live
+server, and returns to the priority one as soon as it answers again (2 ticks). Picking another
+server by hand while the priority one is alive is left alone. Without a priority server the
+tick only refreshes the subscription. clash_api is always on in subscription mode (loopback
+`127.0.0.1:9099` + random secret unless the dashboard is enabled); the web UI itself stays opt-in.
+After updating, run `vpnc subscribe` once to switch the old refresh job to the new tick.
+
 ## Web dashboard
 
 Both single-server and subscription configs can optionally turn on sing-box's built-in

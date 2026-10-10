@@ -216,7 +216,7 @@ os_subscription_timer_write() {
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/vpnc</string>
-    <string>subscribe</string>
+    <string>_tick</string>
   </array>
   <key>StartInterval</key>
   <integer>${interval_sec}</integer>
@@ -260,7 +260,7 @@ os_subscription_timer_remove() {
 
 os_subscription_timer_status() {
   if _launchd_loaded "$SUBSCRIPTION_LAUNCHD_LABEL"; then
-    echo "on, every ${SUBSCRIPTION_REFRESH_SEC}s"
+    echo "on, refresh every ${SUBSCRIPTION_REFRESH_SEC}s, tick every ${WATCH_INTERVAL_SEC}s"
   else
     echo "off"
   fi

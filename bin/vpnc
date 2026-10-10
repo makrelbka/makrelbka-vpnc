@@ -60,6 +60,12 @@ main() {
         *) die "Usage: $(basename "$0") rules {edit|import|list|toggle|apply}" ;;
       esac
       ;;
+    primary)
+      cmd_primary "${2:-}"
+      ;;
+    _tick)
+      cmd_tick
+      ;;
     status)
       ensure_runtime_dependencies
       os_service_status
@@ -75,7 +81,7 @@ main() {
       ;;
     restart)
       ensure_runtime_dependencies
-      os_service_restart
+      restart_service
       ;;
     enable)
       ensure_runtime_dependencies

@@ -34,6 +34,20 @@ RULES_SEED_URL="${VPNC_RULES_SEED_URL:-}"
 # once a subscription is active; torn down when switching back to single-server mode.
 SUBSCRIPTION_REFRESH_SEC="${VPNC_SUBSCRIPTION_REFRESH_SEC:-300}"
 
+# Failover watcher (`vpnc _tick`, run by the same background job as the subscription
+# refresh). The tick fires every WATCH_INTERVAL_SEC; the subscription itself is only
+# re-fetched every SUBSCRIPTION_REFRESH_SEC. clash_api without the web UI listens on
+# VPNC_CONTROL_BIND (loopback) with a random secret kept in the subscription state file.
+WATCH_INTERVAL_SEC="${VPNC_WATCH_SEC:-20}"
+WATCH_FAIL_TICKS="${VPNC_WATCH_FAIL_TICKS:-2}"
+WATCH_OK_TICKS="${VPNC_WATCH_OK_TICKS:-2}"
+CONTROL_BIND_DEFAULT="${VPNC_CONTROL_BIND:-127.0.0.1:9099}"
+WATCH_FILE="${CONFIG_DIR}/vpnc-watch.json"
+PROBE_URL="https://www.gstatic.com/generate_204"
+# Copy of the config sing-box was last (re)started with. A subscription refresh compares the
+# new config against it to decide whether a restart (which drops every connection) is needed.
+RUNNING_FILE="${CONFIG_DIR}/config.running.json"
+
 SUDO=""
 if [[ "${EUID}" -ne 0 ]]; then
   if ! command -v sudo >/dev/null 2>&1; then
@@ -642,6 +656,31 @@ select_clash_api_bind() {
   fi
 }
 
+# Optional "priority server" step of the wizard (see cmd_primary). Needs the parsed server
+# list, so it runs after the subscription is downloaded. Enter = no priority server, or
+# keep the current one when reconfiguring; 0 clears it. Sets SUB_PRIMARY.
+select_primary_server() {
+  local current="$SUB_PRIMARY" tags n=0 tag choice default_label
+  tags="$(jq -r '.[]' <<<"$SUBSCRIPTION_TAGS_JSON")"
+  echo >&2
+  echo "Priority server (optional, advanced: stay on it, fall back to others if it fails, return when it is back):" >&2
+  while IFS= read -r tag; do
+    n=$((n + 1))
+    printf '  %2d) %s\n' "$n" "$tag" >&2
+  done <<<"$tags"
+  if [[ -n "$current" ]]; then default_label="keep current: ${current}"; else default_label="none"; fi
+  read -r -p "Enter number [1-${n}], 0 = none (default: ${default_label}): " choice
+  if [[ -z "$choice" ]]; then
+    return
+  elif [[ "$choice" == "0" ]]; then
+    SUB_PRIMARY=""
+  elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); then
+    SUB_PRIMARY="$(sed -n "${choice}p" <<<"$tags")"
+  else
+    warn "Invalid choice, leaving the priority server as is"
+  fi
+}
+
 # A well-known path the invoking (non-root) user can drop a rules JSON into without
 # needing sudo, so "I already put a file there" in select_rules_source has somewhere
 # fixed to point at. Resolves the real user's home even when running under sudo.
@@ -847,38 +886,42 @@ configure_vpn() {
 
   local mode input_type user_scope outbound uri json_payload include_uids_json uri_scheme dashboard_enabled sub_url
 
+  # One question at a time: choose a format, paste it right away, only then move on to
+  # rules, users and the dashboard.
   input_type="$(select_input_type)"
+  mode=""
+  case "$input_type" in
+    subscription)
+      ensure_cmd curl base64
+      sub_url="$(read_subscription_url)"
+      ;;
+    url)
+      echo
+      read -r -p "Paste VPN URL: " uri
+      uri_scheme="$(detect_uri_scheme "$uri")"
+      [[ "$uri_scheme" != "unknown" ]] || die "Unsupported URI scheme. Expected vless:// or ss://"
+      outbound="$(build_outbound_from_uri "$uri")"
+      ;;
+    *)
+      mode="$(select_mode)"
+      json_payload="$(read_json_payload)"
+      outbound="$(build_outbound_from_json "$json_payload" "$mode")"
+      ;;
+  esac
 
   # Asked once here (never during the unattended `subscribe` background refresh) so it
-  # covers both the single-server and subscription paths below. Runs after the mode
-  # choice above so the first question on a fresh setup is "what am I connecting to",
-  # not "how should routing rules work".
+  # covers both the single-server and subscription paths.
   select_rules_source
 
   if [[ "$input_type" == "subscription" ]]; then
-    ensure_cmd curl base64
-    sub_url="$(read_subscription_url)"
     dashboard_enabled="$(select_dashboard_enabled)"
     [[ "$dashboard_enabled" == "true" ]] && CLASH_API_BIND="$(select_clash_api_bind)"
-    configure_subscription "$sub_url" "$dashboard_enabled"
+    configure_subscription "$sub_url" "$dashboard_enabled" ask_primary
     return
   fi
 
   user_scope="$(select_user_scope)"
   include_uids_json='[]'
-  mode=""
-
-  if [[ "$input_type" == "url" ]]; then
-    echo
-    read -r -p "Paste VPN URL: " uri
-    uri_scheme="$(detect_uri_scheme "$uri")"
-    [[ "$uri_scheme" != "unknown" ]] || die "Unsupported URI scheme. Expected vless:// or ss://"
-    outbound="$(build_outbound_from_uri "$uri")"
-  else
-    mode="$(select_mode)"
-    json_payload="$(read_json_payload)"
-    outbound="$(build_outbound_from_json "$json_payload" "$mode")"
-  fi
 
   if [[ "$user_scope" == "selected" ]]; then
     include_uids_json="$(read_selected_user_uids)"
@@ -908,7 +951,7 @@ configure_vpn() {
   os_service_enable >/dev/null
 
   run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE"
-  os_service_restart
+  restart_service
   sleep 2
 
   if os_service_is_active; then
@@ -1124,6 +1167,9 @@ write_subscription_config() {
     --argjson dashboard_enabled "$dashboard_enabled" \
     --arg clash_bind "$CLASH_API_BIND" \
     --arg clash_ui_dir "$CLASH_UI_DIR" \
+    --arg primary "$SUB_PRIMARY" \
+    --arg control_bind "$SUB_CONTROL_BIND" \
+    --arg control_secret "$SUB_CONTROL_SECRET" \
     '
     {
       log: { level: "info" },
@@ -1152,7 +1198,7 @@ write_subscription_config() {
         )
       ],
       outbounds: (
-        [{ type: "selector", tag: "proxy", outbounds: (["auto"] + $tags + ["direct"]), default: "auto" }]
+        [{ type: "selector", tag: "proxy", outbounds: (["auto"] + $tags + ["direct"]), default: (if ($primary != "" and ($tags | index($primary))) then $primary else "auto" end) }]
         + [{ type: "urltest", tag: "auto", outbounds: $tags, url: "https://www.gstatic.com/generate_204", interval: "3m", tolerance: 50 }]
         + $proxies
         + [{ type: "direct", tag: "direct" }]
@@ -1164,24 +1210,26 @@ write_subscription_config() {
         final: "proxy"
       }
     }
-    + (
-      if $dashboard_enabled then
-        {
-          experimental: {
-            clash_api: {
-              external_controller: $clash_bind,
-              external_ui: $clash_ui_dir,
-              external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
-              external_ui_download_detour: "direct",
-              secret: "",
-              default_mode: "rule"
-            }
-          }
-        }
-      else
-        {}
-      end
-    )
+    # clash_api is always on in subscription mode: vpnc itself uses it to ping servers and
+    # switch the selector (see cmd_tick). The web UI part stays opt-in.
+    + {
+      experimental: {
+        clash_api: (
+          { external_controller: $control_bind, secret: $control_secret, default_mode: "rule" }
+          + (
+            if $dashboard_enabled then
+              {
+                external_ui: $clash_ui_dir,
+                external_ui_download_url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+                external_ui_download_detour: "direct"
+              }
+            else
+              {}
+            end
+          )
+        )
+      }
+    }
     ' > "$tmp_config"
 
   run_root install -d -m 0755 "$CONFIG_DIR"
@@ -1196,11 +1244,16 @@ write_subscription_config() {
   # connections on ticks where nothing actually changed. Sets SUBSCRIPTION_CONFIG_CHANGED
   # for the caller.
   SUBSCRIPTION_CONFIG_CHANGED="true"
+  SUBSCRIPTION_RESTART_NEEDED="true"
   if run_root test -f "$CONFIG_FILE" && run_root cmp -s "$tmp_config" "$CONFIG_FILE"; then
     SUBSCRIPTION_CONFIG_CHANGED="false"
+    SUBSCRIPTION_RESTART_NEEDED="false"
     rm -f "$tmp_config"
     return
   fi
+  # A changed file does not always need a restart: if the servers in use are untouched the
+  # new config is only written to disk and takes effect at the next restart.
+  config_restart_needed "$tmp_config" || SUBSCRIPTION_RESTART_NEEDED="false"
 
   if run_root test -f "$CONFIG_FILE"; then
     backup_file="${CONFIG_DIR}/config.backup-$(date +%Y%m%d-%H%M%S).json"
@@ -1219,10 +1272,13 @@ write_subscription_config() {
 configure_subscription() {
   local url="$1"
   local dashboard_enabled="${2:-false}"
+  local ask_primary="${3:-}"
 
   ensure_runtime_dependencies
   ensure_cmd jq sing-box curl base64
   os_check_cmds
+
+  load_subscription_extras "$dashboard_enabled"
 
   log "Downloading subscription..."
   local text server_count
@@ -1231,6 +1287,7 @@ configure_subscription() {
   build_outbounds_from_subscription "$text"
   server_count="$(jq 'length' <<<"$SUBSCRIPTION_TAGS_JSON")"
   log "Parsed servers: $server_count"
+  [[ "$ask_primary" == "ask_primary" ]] && select_primary_server
 
   write_subscription_config "$dashboard_enabled"
   os_service_write
@@ -1243,7 +1300,12 @@ configure_subscription() {
     --arg fetched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson dashboard_enabled "$dashboard_enabled" \
     --arg clash_api_bind "$CLASH_API_BIND" \
-    '{url: $url, proxy_count: $count, fetched_at: $fetched_at, dashboard_enabled: $dashboard_enabled, clash_api_bind: $clash_api_bind}' > "$tmp_state"
+    --argjson fetched_epoch "$(date +%s)" \
+    --arg primary "$SUB_PRIMARY" \
+    --arg api_secret "$SUB_API_SECRET" \
+    --arg control_bind "$SUB_CONTROL_BIND" \
+    --arg control_secret "$SUB_CONTROL_SECRET" \
+    '{url: $url, proxy_count: $count, fetched_at: $fetched_at, fetched_epoch: $fetched_epoch, dashboard_enabled: $dashboard_enabled, clash_api_bind: $clash_api_bind, primary: $primary, api_secret: $api_secret, control_bind: $control_bind, control_secret: $control_secret}' > "$tmp_state"
   run_root install -d -m 0755 "$CONFIG_DIR"
   run_root install -m 0600 "$tmp_state" "$SUBSCRIPTION_STATE_FILE"
   rm -f "$tmp_state"
@@ -1261,9 +1323,11 @@ configure_subscription() {
   # Only restart (and drop active connections) when the config actually changed, or
   # when sing-box isn't already running — matters for the periodic refresh timer,
   # which calls this every $SUBSCRIPTION_REFRESH_SEC even if the server list is stable.
-  if [[ "$SUBSCRIPTION_CONFIG_CHANGED" == "true" ]] || ! os_service_is_active; then
-    os_service_restart
+  if [[ "$SUBSCRIPTION_RESTART_NEEDED" == "true" ]] || ! os_service_is_active; then
+    restart_service
     sleep 2
+  elif [[ "$SUBSCRIPTION_CONFIG_CHANGED" == "true" ]]; then
+    log "Subscription updated ($server_count servers) — servers in use unchanged, kept the running connection (new list applies at the next restart)"
   else
     log "Subscription unchanged ($server_count servers) — kept the running connection"
   fi
@@ -1274,8 +1338,11 @@ configure_subscription() {
   # instance is a self-unload race that can leave the timer not reloaded. Only
   # (re)provision when it's actually missing (first run, or after `configure` switched
   # back from single-server mode).
-  if [[ "$(os_subscription_timer_status)" == "off" ]]; then
-    os_subscription_timer_write "$SUBSCRIPTION_REFRESH_SEC"
+  # Installs from before the failover watcher have a job that runs `subscribe`; an
+  # interactive run swaps it for `_tick` (never from the job itself: VPNC_FROM_TIMER).
+  if [[ "$(os_subscription_timer_status)" == "off" ]] \
+    || { [[ -z "${VPNC_FROM_TIMER:-}" ]] && ! run_root grep -q '_tick' "$SUBSCRIPTION_SERVICE_FILE" 2>/dev/null; }; then
+    os_subscription_timer_write "$WATCH_INTERVAL_SEC"
     os_subscription_timer_enable
   fi
 
@@ -1325,6 +1392,339 @@ subscribe_vpn() {
   fi
 
   configure_subscription "$url" "$dashboard_enabled"
+}
+
+# ---------------------------------------------------------------------------
+# Failover watcher. Optional "priority config" (`vpnc primary <name>`): the selector
+# `proxy` sits on that server; the background tick pings servers through sing-box's
+# clash_api and, when the priority server stops answering, first looks for an updated
+# config of that location in the subscription, then falls back to the fastest live
+# server and returns to the priority one as soon as it is alive again. Without a
+# priority server the tick only refreshes the subscription.
+# ---------------------------------------------------------------------------
+
+# Sets SUB_PRIMARY / SUB_API_SECRET / SUB_CONTROL_BIND / SUB_CONTROL_SECRET from the saved
+# subscription state (so a refresh keeps the choice and doesn't churn the config bytes).
+load_subscription_extras() {
+  local dashboard_enabled="${1:-false}"
+  SUB_PRIMARY=""
+  SUB_API_SECRET=""
+  if run_root test -f "$SUBSCRIPTION_STATE_FILE"; then
+    SUB_PRIMARY="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
+    SUB_API_SECRET="$(run_root jq -r '.api_secret // ""' "$SUBSCRIPTION_STATE_FILE")"
+  fi
+  [[ -n "$SUB_API_SECRET" ]] || SUB_API_SECRET="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+
+  if [[ "$dashboard_enabled" == "true" ]]; then
+    SUB_CONTROL_BIND="$CLASH_API_BIND"
+    SUB_CONTROL_SECRET=""
+  else
+    SUB_CONTROL_BIND="$CONTROL_BIND_DEFAULT"
+    SUB_CONTROL_SECRET="$SUB_API_SECRET"
+  fi
+}
+
+# api_call METHOD PATH [JSON_BODY] — talks to the running sing-box clash_api.
+api_call() {
+  local method="$1" path="$2" body="${3:-}" bind secret
+  bind="$(run_root jq -r '.control_bind // empty' "$SUBSCRIPTION_STATE_FILE")"
+  secret="$(run_root jq -r '.control_secret // ""' "$SUBSCRIPTION_STATE_FILE")"
+  [[ -n "$bind" ]] || return 1
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 8 -X "$method" -H "Authorization: Bearer ${secret}" \
+      -H 'Content-Type: application/json' -d "$body" "http://${bind}${path}"
+  else
+    curl -fsS --max-time 8 -X "$method" -H "Authorization: Bearer ${secret}" "http://${bind}${path}"
+  fi
+}
+
+uri_encode() {
+  jq -rn --arg v "$1" '$v | @uri'
+}
+
+# Real server tags (no selector/urltest/direct) from the running config, one per line.
+subscription_tags() {
+  run_root jq -r '.outbounds[] | select(.type | IN("selector", "urltest", "direct") | not) | .tag' "$CONFIG_FILE"
+}
+
+# Delay in ms through one server, or 0 when it does not answer.
+probe_delay() {
+  local out
+  out="$(api_call GET "/proxies/$(uri_encode "$1")/delay?url=$(uri_encode "$PROBE_URL")&timeout=4000" 2>/dev/null)" || { echo 0; return; }
+  jq -r '.delay // 0' <<<"$out" 2>/dev/null || echo 0
+}
+
+# probe_all DIR — writes DIR/<n> = "<delay>\t<tag>" for every server, 8 probes at a time.
+probe_all() {
+  local dir="$1" n=0 tag
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    n=$((n + 1))
+    ( printf '%s\t%s\n' "$(probe_delay "$tag")" "$tag" > "$dir/$n" ) &
+    (( n % 8 )) || wait
+  done < <(subscription_tags)
+  wait
+}
+
+restart_service() {
+  os_service_restart
+  run_root install -m 0600 "$CONFIG_FILE" "$RUNNING_FILE" 2>/dev/null || true
+}
+
+# active_leaf — the server traffic goes through right now (selector choice, or its urltest
+# pick when on "auto"). Fails when clash_api is unreachable.
+active_leaf() {
+  local now leaf
+  now="$(api_call GET /proxies/proxy 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || return 1
+  [[ -n "$now" ]] || return 1
+  leaf="$now"
+  if [[ "$now" == "auto" ]]; then
+    leaf="$(api_call GET /proxies/auto 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || return 1
+  fi
+  [[ -n "$leaf" ]] || return 1
+  echo "$leaf"
+}
+
+# config_restart_needed NEW_CONFIG — exit 0 (restart) unless it is certain that only the
+# server list changed. Server definitions are NOT a reason to restart: providers rotate
+# tls/reality parameters every few minutes, and a running connection keeps working with the
+# definition it started with. Changed definitions wait on disk until the server stops
+# answering (cmd_tick -> watch_apply_pending) or until the next restart. Everything outside
+# `outbounds` (dns, route rules, inbounds, clash_api) changing needs a restart. Any doubt
+# (no baseline, service down, jq error) means restart.
+config_restart_needed() {
+  local new="$1" old="$RUNNING_FILE" res
+  run_root test -f "$old" || old="$CONFIG_FILE"
+  run_root test -f "$old" || return 0
+  os_service_is_active || return 0
+  res="$(run_root jq -n --slurpfile o "$old" --slurpfile n "$new" \
+    '($o[0] | del(.outbounds)) != ($n[0] | del(.outbounds))' 2>/dev/null)" || return 0
+  [[ "$res" == "false" ]] && return 1
+  return 0
+}
+
+# config_pending — the config on disk differs from what sing-box was started with.
+config_pending() {
+  run_root test -f "$RUNNING_FILE" && ! run_root cmp -s "$CONFIG_FILE" "$RUNNING_FILE"
+}
+
+watch_get() {
+  local key="$1" default="$2" v=""
+  if run_root test -f "$WATCH_FILE"; then
+    v="$(run_root jq -r --arg k "$key" '.[$k] // empty | tostring' "$WATCH_FILE" 2>/dev/null || true)"
+  fi
+  echo "${v:-$default}"
+}
+
+# watch_save FAIL OK FAILOVER REFRESHED  (other keys, e.g. last_attempt, are kept)
+watch_save() {
+  local tmp base
+  tmp="$(mktemp)"
+  base='{}'
+  run_root test -f "$WATCH_FILE" && base="$(run_root cat "$WATCH_FILE")"
+  jq -n --argjson base "$base" --argjson fail "$1" --argjson ok "$2" --argjson failover "$3" --argjson refreshed "$4" \
+    '$base + {fail: $fail, ok: $ok, failover: $failover, refreshed: $refreshed}' > "$tmp"
+  run_root install -m 0600 "$tmp" "$WATCH_FILE"
+  rm -f "$tmp"
+}
+
+# watch_set KEY JSON_VALUE
+watch_set() {
+  local tmp base
+  tmp="$(mktemp)"
+  base='{}'
+  run_root test -f "$WATCH_FILE" && base="$(run_root cat "$WATCH_FILE")"
+  jq -n --argjson base "$base" --arg k "$1" --argjson v "$2" '$base + {($k): $v}' > "$tmp"
+  run_root install -m 0600 "$tmp" "$WATCH_FILE"
+  rm -f "$tmp"
+}
+
+watch_mark_attempt() {
+  watch_set last_attempt "$(date +%s)"
+}
+
+# Re-fetch the subscription when SUBSCRIPTION_REFRESH_SEC passed since the last fetch or
+# attempt (failed fetches are retried at the same pace, not every tick). $1 = "force".
+watch_refresh() {
+  local force="${1:-}" now last fetched
+  now="$(date +%s)"
+  fetched="$(run_root jq -r '.fetched_epoch // 0' "$SUBSCRIPTION_STATE_FILE")"
+  last="$(watch_get last_attempt 0)"
+  (( fetched > last )) && last="$fetched"
+  if [[ "$force" != "force" ]] && (( now - last < SUBSCRIPTION_REFRESH_SEC )); then
+    return 0
+  fi
+  watch_mark_attempt
+  # Background subshell + wait: keeps `set -e` active inside subscribe_vpn (a plain
+  # `( ... ) || warn` would switch it off and e.g. a failed `sing-box check` would not stop the restart).
+  ( subscribe_vpn ) &
+  wait $! || warn "Subscription refresh failed; keeping the running config"
+}
+
+# switch_to TAG REASON
+switch_to() {
+  api_call PUT /proxies/proxy "$(jq -cn --arg n "$1" '{name: $n}')" >/dev/null \
+    && log "Failover: switched to '$1' ($2)" \
+    || warn "Could not switch to '$1' via clash_api"
+}
+
+# best_alive DIR EXCLUDE... — fastest tag with delay > 0 not in EXCLUDE.
+best_alive() {
+  local dir="$1" best="" best_ms=0 f ms tag ex skip
+  shift
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    IFS=$'\t' read -r ms tag < "$f"
+    (( ms > 0 )) || continue
+    skip=0
+    for ex in "$@"; do [[ "$tag" == "$ex" ]] && skip=1; done
+    (( skip )) && continue
+    if [[ -z "$best" ]] || (( ms < best_ms )); then best="$tag"; best_ms="$ms"; fi
+  done
+  echo "$best"
+}
+
+delay_in_dir() {
+  local dir="$1" want="$2" f ms tag
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    IFS=$'\t' read -r ms tag < "$f"
+    [[ "$tag" == "$want" ]] && { echo "$ms"; return; }
+  done
+  echo 0
+}
+
+watch_failover() {
+  local primary now dir fail ok failover refreshed p_ms now_ms alt
+  primary="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
+  [[ -n "$primary" ]] || return 0
+
+  now="$(api_call GET /proxies/proxy 2>/dev/null | jq -r '.now // empty' 2>/dev/null)" || return 0
+  [[ -n "$now" ]] || return 0   # sing-box not up (restarting) — try again next tick
+
+  if ! subscription_tags | grep -qxF -- "$primary"; then
+    warn "Priority server '$primary' is not in the subscription any more — failover idle"
+    return 0
+  fi
+
+  dir="$(mktemp -d)"
+  probe_all "$dir"
+  p_ms="$(delay_in_dir "$dir" "$primary")"
+  now_ms="$(delay_in_dir "$dir" "$now")"
+
+  fail="$(watch_get fail 0)"; ok="$(watch_get ok 0)"
+  failover="$(watch_get failover false)"; refreshed="$(watch_get refreshed false)"
+
+  if (( p_ms > 0 )); then ok=$((ok + 1)); fail=0; refreshed=false
+  else fail=$((fail + 1)); ok=0; fi
+
+  if [[ "$now" == "$primary" ]]; then
+    failover=false
+    if (( fail >= WATCH_FAIL_TICKS )); then
+      if [[ "$refreshed" == "false" ]]; then
+        # Maybe the provider already published a new config for this location.
+        refreshed=true
+        warn "Priority server '$primary' is not answering — refreshing the subscription for an updated config"
+        watch_save "$fail" "$ok" "$failover" "$refreshed"
+        watch_refresh force
+        # A newer definition of this server may be waiting on disk (see config_restart_needed).
+        if config_pending; then
+          log "Applying the pending config (restart) for '$primary'"
+          restart_service
+        fi
+        rm -rf "$dir"
+        return 0
+      fi
+      alt="$(best_alive "$dir" "$primary")"
+      if [[ -n "$alt" ]]; then
+        switch_to "$alt" "priority server '$primary' is down"
+        failover=true
+      else
+        warn "Priority server '$primary' is down and no other server answers"
+      fi
+    fi
+  elif [[ "$failover" == "true" ]]; then
+    if (( ok >= WATCH_OK_TICKS )); then
+      switch_to "$primary" "priority server is back"
+      failover=false
+    elif (( now_ms <= 0 )); then
+      alt="$(best_alive "$dir" "$primary" "$now")"
+      [[ -n "$alt" ]] && switch_to "$alt" "'$now' stopped answering"
+    fi
+  fi
+  # now != primary and no failover of ours → the user picked it by hand; leave it.
+
+  watch_save "$fail" "$ok" "$failover" "$refreshed"
+  rm -rf "$dir"
+}
+
+# `vpnc _tick` — run by the background timer/job. Quiet unless something happens.
+cmd_tick() {
+  export VPNC_FROM_TIMER=1
+  run_root test -f "$SUBSCRIPTION_STATE_FILE" || return 0
+  ensure_cmd jq curl
+  watch_refresh
+  watch_apply_pending
+  watch_failover
+}
+
+# New server definitions are written to disk without restarting (see config_restart_needed).
+# When the server in use stops answering WATCH_FAIL_TICKS ticks in a row, restart onto the
+# new config — it may be exactly what fixes it. Only for the no-priority case; with a
+# priority server watch_failover handles it.
+watch_apply_pending() {
+  local leaf n
+  [[ -z "$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")" ]] || return 0
+  if ! config_pending; then watch_set pend_fail 0; return 0; fi
+  leaf="$(active_leaf)" || return 0
+  if (( $(probe_delay "$leaf") > 0 )); then watch_set pend_fail 0; return 0; fi
+  n=$(( $(watch_get pend_fail 0) + 1 ))
+  watch_set pend_fail "$n"
+  if (( n >= WATCH_FAIL_TICKS )); then
+    warn "Server '$leaf' is not answering and a newer config is waiting — restarting onto it"
+    restart_service
+    watch_set pend_fail 0
+  fi
+}
+
+# `vpnc primary [name|number|off]` — show / set / clear the priority server.
+cmd_primary() {
+  local arg="${1:-}" cur tags n=0 tag target="" tmp
+  run_root test -f "$SUBSCRIPTION_STATE_FILE" || die "Priority server needs a subscription: $(basename "$0") subscribe <url>"
+  ensure_cmd jq
+  cur="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
+  tags="$(subscription_tags)"
+
+  if [[ -z "$arg" ]]; then
+    echo "Priority server: ${cur:-(none)}"
+    while IFS= read -r tag; do
+      n=$((n + 1))
+      printf '  %2d) %s%s\n' "$n" "$tag" "$([[ "$tag" == "$cur" ]] && echo '  <- priority')"
+    done <<<"$tags"
+    echo "Set: $(basename "$0") primary <name|number>   Clear: $(basename "$0") primary off"
+    return
+  fi
+
+  if [[ "$arg" == "off" ]]; then
+    target=""
+  elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+    target="$(sed -n "${arg}p" <<<"$tags")"
+    [[ -n "$target" ]] || die "No server number $arg"
+  else
+    grep -qxF -- "$arg" <<<"$tags" || die "No such server: $arg (list: $(basename "$0") primary)"
+    target="$arg"
+  fi
+
+  tmp="$(mktemp)"
+  run_root jq --arg p "$target" '.primary = $p' "$SUBSCRIPTION_STATE_FILE" > "$tmp"
+  run_root install -m 0600 "$tmp" "$SUBSCRIPTION_STATE_FILE"
+  rm -f "$tmp"
+  watch_save 0 0 false false
+  if [[ -n "$target" ]]; then log "Priority server: $target"; else log "Priority server cleared"; fi
+  # Rewrites the selector default on disk (no restart needed for that alone)...
+  subscribe_vpn
+  # ...and switches the running selector right away.
+  [[ -z "$target" ]] || switch_to "$target" "set as priority"
 }
 
 cmd_rules_edit() {
@@ -1419,7 +1819,7 @@ cmd_rules_apply() {
 
   run_root /usr/local/bin/sing-box check -c "$CONFIG_FILE" \
     || die "New config failed sing-box validation, restore from a .backup-*.json"
-  os_service_restart
+  restart_service
   log "Rules applied and sing-box restarted"
 }
 
@@ -1478,6 +1878,15 @@ show_status_summary() {
     echo "  Servers: $(run_root jq -r '.proxy_count' "$SUBSCRIPTION_STATE_FILE")"
     echo "  Last fetched: $(run_root jq -r '.fetched_at' "$SUBSCRIPTION_STATE_FILE")"
     echo "  Auto-refresh: $(os_subscription_timer_status)"
+    if run_root test -f "$RUNNING_FILE" && ! run_root cmp -s "$CONFIG_FILE" "$RUNNING_FILE"; then
+      echo "  Config on disk is newer than the running one (applies at next restart: $(basename "$0") restart)"
+    fi
+    local primary
+    primary="$(run_root jq -r '.primary // ""' "$SUBSCRIPTION_STATE_FILE")"
+    echo "  Priority server: ${primary:-none} (set: $(basename "$0") primary)"
+    if [[ -n "$primary" ]]; then
+      echo "  Failover active: $(watch_get failover false), priority fail/ok ticks: $(watch_get fail 0)/$(watch_get ok 0)"
+    fi
   fi
 
   if [[ "$mode" != "unknown" ]]; then
@@ -1505,6 +1914,8 @@ Commands:
                      dashboard on/off choice saved from configure. With no prior
                      subscription on file, asks once whether to enable the dashboard.
                      Also (re)installs the background auto-refresh timer (see below).
+  primary [name|n|off]  Advanced: priority server for a subscription. Shows the list
+                     without arguments. See "Priority server" below.
   rules edit         Edit the direct-vs-VPN rules file (\$EDITOR, default nano)
   rules import <path|url>   Replace the rules file from a {"rules": [...]} JSON
   rules list         Show rule groups and their on/off state
@@ -1546,6 +1957,14 @@ Subscription auto-refresh:
   refresh is a no-op. Override the interval with VPNC_SUBSCRIPTION_REFRESH_SEC (seconds)
   before running configure/subscribe. Switching back to single-server mode removes the
   timer automatically.
+
+Priority server (advanced, subscription mode):
+  "${cmd} primary <name|number>" pins one server: the connection goes through it. A
+  background tick (every ${WATCH_INTERVAL_SEC}s, VPNC_WATCH_SEC) pings servers via sing-box's clash_api.
+  If the priority server stops answering, the subscription is refreshed once to pick up
+  an updated config of that location; if it still fails, traffic moves to the fastest
+  live server and returns to the priority one as soon as it answers again. "primary off"
+  clears it. Without a priority server the tick only refreshes the subscription.
 HELP_EOF
 }
 

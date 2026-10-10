@@ -190,7 +190,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/vpnc subscribe
+ExecStart=/usr/local/bin/vpnc _tick
 UNIT_EOF
   run_root install -m 0644 "$tmp_service" "$SUBSCRIPTION_SERVICE_FILE"
   rm -f "$tmp_service"
@@ -201,7 +201,7 @@ UNIT_EOF
 Description=Periodic vpnc subscription refresh
 
 [Timer]
-OnBootSec=2min
+OnBootSec=1min
 OnUnitActiveSec=${interval_sec}s
 Persistent=true
 Unit=${SUBSCRIPTION_SERVICE_UNIT}
@@ -236,7 +236,7 @@ os_subscription_timer_status() {
   if run_root systemctl is-active --quiet "$SUBSCRIPTION_TIMER_UNIT" 2>/dev/null; then
     local next
     next="$(run_root systemctl show "$SUBSCRIPTION_TIMER_UNIT" -p NextElapseUSecRealtime --value 2>/dev/null)"
-    echo "on, every ${SUBSCRIPTION_REFRESH_SEC}s (next: ${next:-unknown})"
+    echo "on, refresh every ${SUBSCRIPTION_REFRESH_SEC}s, tick every ${WATCH_INTERVAL_SEC}s (next: ${next:-unknown})"
   else
     echo "off"
   fi
