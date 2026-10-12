@@ -956,6 +956,12 @@ build_mihomo_config() {
             + (if ($direct | length) > 0 then
                  {"fake-ip-filter": $direct, "nameserver-policy": ($direct | map({(.): "system"}) | add)}
                else {} end)),
+      # Apps that connect to a cached/DoH-resolved IP never ask our fake-ip DNS, so the rules see
+      # no domain and the traffic falls to MATCH. The sniffer reads the host from TLS/HTTP/QUIC;
+      # override-destination:false keeps dialing the IP the app chose (no extra DNS for DIRECT).
+      sniffer: {enable: true, "force-dns-mapping": true, "parse-pure-ip": true, "override-destination": false,
+                sniff: {HTTP: {ports: [80, "8080-8880"]}, TLS: {ports: [443, 8443]}, QUIC: {ports: [443, 8443]}},
+                "skip-domain": ["Mijia Cloud", "+.push.apple.com"]},
       "proxy-groups": groups,
       rules: ($rules + ["MATCH,PROXY"])
     }
